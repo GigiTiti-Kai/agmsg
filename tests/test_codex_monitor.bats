@@ -9,6 +9,7 @@ setup() {
   export TEST_MONITOR_PID=""
   export TEST_TUI_RELEASE_FILE=""
   export TEST_TUI_EXIT_FILE=""
+  export TEST_LISTENER_PID_FILE=""
 
   # Fake codex for codex-monitor tests.
   #   --version            -> prints "codex-cli $FAKE_CODEX_VERSION"
@@ -51,7 +52,10 @@ case "${1:-}" in
     # its argv ("...real-codex app-server --listen") is what codex-monitor's
     # cmdline check matches.
     python3 - <<'PY' &
-import socket, sys, os
+import socket, sys, os, signal
+watch_parent = os.environ.get("FAKE_LISTENER_WATCH_PARENT", "1") == "1"
+if os.environ.get("FAKE_LISTENER_IGNORE_TERM") == "1":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", 0)); s.listen(16); s.settimeout(0.2)
@@ -59,7 +63,7 @@ print("codex app-server (WebSockets)")
 print("  listening on: ws://127.0.0.1:%d" % s.getsockname()[1]); sys.stdout.flush()
 ppid = os.getppid()
 while True:
-    if os.getppid() != ppid:
+    if watch_parent and os.getppid() != ppid:
         break
     try:
         c, _ = s.accept(); c.close()
@@ -67,10 +71,13 @@ while True:
         pass
 PY
     child=$!
+    [ -z "${FAKE_LISTENER_PID_FILE:-}" ] || printf '%s' "$child" > "$FAKE_LISTENER_PID_FILE"
     record_server_term() {
       [ -z "${FAKE_TERM_LOG:-}" ] || printf 'server TERM\n' >> "$FAKE_TERM_LOG"
-      kill "$child" 2>/dev/null || true
-      wait "$child" 2>/dev/null || true
+      if [ "${FAKE_FORWARD_SERVER_TERM:-1}" = 1 ]; then
+        kill "$child" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+      fi
       exit 0
     }
     trap record_server_term TERM
@@ -111,6 +118,11 @@ teardown() {
   fi
   [ -z "${TEST_TUI_RELEASE_FILE:-}" ] || : > "$TEST_TUI_RELEASE_FILE"
   [ -z "${TEST_TUI_EXIT_FILE:-}" ] || wait_for_file "$TEST_TUI_EXIT_FILE" || true
+  if [ -n "${TEST_LISTENER_PID_FILE:-}" ] && [ -f "$TEST_LISTENER_PID_FILE" ]; then
+    pid="$(cat "$TEST_LISTENER_PID_FILE" 2>/dev/null || true)"
+    [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
+    [ -z "$pid" ] || wait_for_pid_exit "$pid" || true
+  fi
   for pf in "$TEST_SKILL_DIR"/run/codex-app-server.*.pid; do
     [ -f "$pf" ] || continue
     pid="$(cat "$pf" 2>/dev/null)"
@@ -291,6 +303,24 @@ EOF
   [ "$(find "$TEST_SKILL_DIR/run" -name 'codex-app-server.*' -type f | wc -l | tr -d ' ')" -eq 0 ]
 }
 
+@test "codex-monitor: scoped non-forwarding wrapper exit reaps its listener child" {
+  skip_on_windows "uses Linux setsid process-group semantics"
+  command -v setsid >/dev/null 2>&1 || skip "setsid is not available"
+
+  local listener_pid_file="$TEST_PROJECT/listener.pid"
+  local listener_pid
+  TEST_LISTENER_PID_FILE="$listener_pid_file"
+
+  run env FAKE_FORWARD_SERVER_TERM=0 FAKE_LISTENER_WATCH_PARENT=0 \
+    FAKE_LISTENER_PID_FILE="$listener_pid_file" AGMSG_REAL_CODEX="$FAKE_CODEX" \
+    bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" \
+    --invocation-scope scope-non-forwarding-exit --codex-command codex --
+  [ "$status" -eq 0 ]
+  listener_pid="$(cat "$listener_pid_file")"
+  wait_for_pid_exit "$listener_pid"
+  [ "$(find "$TEST_SKILL_DIR/run" -name 'codex-app-server.*' -type f | wc -l | tr -d ' ')" -eq 0 ]
+}
+
 @test "codex-monitor: scoped TUI exit sends TERM to its captured server and launcher children" {
   local server_term="$TEST_PROJECT/server-term.log"
   local launcher_term="$TEST_PROJECT/launcher-term.log"
@@ -359,15 +389,19 @@ EOF
   local tui_term="$TEST_PROJECT/tui-term.log"
   local tui_exit="$TEST_PROJECT/tui-exit"
   local tui_pid_file="$TEST_PROJECT/tui.pid"
+  local listener_pid_file="$TEST_PROJECT/listener.pid"
   local launcher="$TEST_PROJECT/fake-launcher"
-  local key pidfile server_pid launcher_pid tui_pid monitor_status lock_owner
+  local key pidfile server_pid listener_pid launcher_pid tui_pid monitor_status lock_owner
   _make_term_recording_launcher "$launcher"
   TEST_TUI_RELEASE_FILE="$gate"
   TEST_TUI_EXIT_FILE="$tui_exit"
+  TEST_LISTENER_PID_FILE="$listener_pid_file"
 
   key="$(printf '%s\n%s' "$(cd "$TEST_PROJECT" && pwd -P)" scope-direct-term | ( . "$SCRIPTS/lib/hash.sh"; agmsg_sha1 ))"
   pidfile="$TEST_SKILL_DIR/run/codex-app-server.$key.pid"
-  env FAKE_TERM_LOG="$server_term" FAKE_SERVER_READY_FILE="$server_ready" \
+  env FAKE_FORWARD_SERVER_TERM=0 FAKE_LISTENER_WATCH_PARENT=0 \
+    FAKE_LISTENER_PID_FILE="$listener_pid_file" \
+    FAKE_TERM_LOG="$server_term" FAKE_SERVER_READY_FILE="$server_ready" \
     FAKE_LAUNCHER_TERM_LOG="$launcher_term" FAKE_LAUNCHER_READY_FILE="$launcher_ready" \
     FAKE_TUI_GATE="$gate" FAKE_TUI_READY_FILE="$tui_ready" FAKE_TUI_EXIT_MARKER="$tui_exit" \
     FAKE_TUI_PID_FILE="$tui_pid_file" FAKE_TUI_TERM_LOG="$tui_term" \
@@ -377,9 +411,11 @@ EOF
   TEST_MONITOR_PID=$!
 
   wait_for_file_contains "$server_ready" '[0-9]'
+  wait_for_file_contains "$listener_pid_file" '[0-9]'
   wait_for_file_contains "$launcher_ready" '[0-9]'
   wait_for_file_contains "$tui_ready" '[0-9]'
   server_pid="$(cat "$pidfile")"
+  listener_pid="$(cat "$listener_pid_file")"
   launcher_pid="$(cat "$launcher_ready")"
   tui_pid="$(cat "$tui_pid_file")"
 
@@ -391,6 +427,7 @@ EOF
   [ "$monitor_status" -eq 143 ]
   wait_for_pid_exit "$tui_pid"
   wait_for_pid_exit "$server_pid"
+  wait_for_pid_exit "$listener_pid"
   wait_for_pid_exit "$launcher_pid"
   grep -qx 'tui TERM' "$tui_term"
   grep -qx 'server TERM' "$server_term"
@@ -399,10 +436,76 @@ EOF
   [ -z "$lock_owner" ]
 }
 
+@test "codex-monitor: scoped non-forwarding TERM-ignoring listener escalates to KILL" {
+  skip_on_windows "uses Linux setsid process-group semantics"
+  command -v setsid >/dev/null 2>&1 || skip "setsid is not available"
+
+  local listener_pid_file="$TEST_PROJECT/listener.pid"
+  local listener_pid
+  TEST_LISTENER_PID_FILE="$listener_pid_file"
+
+  run env FAKE_FORWARD_SERVER_TERM=0 FAKE_LISTENER_WATCH_PARENT=0 \
+    FAKE_LISTENER_IGNORE_TERM=1 FAKE_LISTENER_PID_FILE="$listener_pid_file" \
+    AGMSG_REAL_CODEX="$FAKE_CODEX" bash "$TYPES/codex/codex-monitor.sh" \
+    --project "$TEST_PROJECT" --invocation-scope scope-non-forwarding-kill \
+    --codex-command codex --
+  [ "$status" -eq 0 ]
+  listener_pid="$(cat "$listener_pid_file")"
+  wait_for_pid_exit "$listener_pid"
+  refute grep -Fq 'survived cleanup' <<< "$output"
+  [ "$(find "$TEST_SKILL_DIR/run" -name 'codex-app-server.*' -type f | wc -l | tr -d ' ')" -eq 0 ]
+}
+
+@test "codex-monitor: delayed setsid withholds scoped pidfile and TUI until group verification" {
+  skip_on_windows "uses Linux setsid process-group semantics"
+  command -v setsid >/dev/null 2>&1 || skip "setsid is not available"
+
+  local shim_dir="$TEST_PROJECT/shim-bin"
+  local entered="$TEST_PROJECT/setsid-entered"
+  local tui_ready="$TEST_PROJECT/tui-ready"
+  local gate="$TEST_PROJECT/release-tui"
+  local scope=scope-delayed-setsid
+  local key pidfile real_setsid
+  real_setsid="$(command -v setsid)"
+  key="$(printf '%s\n%s' "$(cd "$TEST_PROJECT" && pwd -P)" "$scope" | ( . "$SCRIPTS/lib/hash.sh"; agmsg_sha1 ))"
+  pidfile="$TEST_SKILL_DIR/run/codex-app-server.$key.pid"
+  mkdir -p "$shim_dir"
+  cat > "$shim_dir/setsid" <<'EOF'
+#!/usr/bin/env bash
+: > "$FAKE_SETSID_ENTERED"
+sleep 0.2
+exec "$REAL_SETSID" "$@"
+EOF
+  chmod +x "$shim_dir/setsid"
+  TEST_TUI_RELEASE_FILE="$gate"
+
+  env PATH="$shim_dir:$PATH" FAKE_SETSID_ENTERED="$entered" REAL_SETSID="$real_setsid" \
+    FAKE_TUI_GATE="$gate" FAKE_TUI_READY_FILE="$tui_ready" AGMSG_REAL_CODEX="$FAKE_CODEX" \
+    bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" \
+    --invocation-scope "$scope" --codex-command codex -- &
+  TEST_MONITOR_PID=$!
+
+  wait_for_file "$entered"
+  [ ! -e "$pidfile" ]
+  [ ! -e "$tui_ready" ]
+  wait_for_file "$pidfile"
+  wait_for_file "$tui_ready"
+  : > "$gate"
+  wait "$TEST_MONITOR_PID"
+  TEST_MONITOR_PID=""
+}
+
 @test "codex-monitor: scoped fail-open exit preserves status and argv" {
   run env FAKE_CODEX_MODE=broken FAKE_TUI_STATUS=37 AGMSG_REAL_CODEX="$FAKE_CODEX" \
     bash "$TYPES/codex/codex-monitor.sh" --project "$TEST_PROJECT" \
     --invocation-scope scope-fail-open --codex-command resume -- --last -C "$TEST_PROJECT"
+  if [ "$(uname -s)" = Linux ] && command -v setsid >/dev/null 2>&1; then
+    [ "$status" -eq 1 ]
+    [ ! -e "$CALL_LOG" ]
+    printf '%s\n' "$output" | grep -Fq 'scoped app-server did not enter an owned process group'
+    [ "$(find "$TEST_SKILL_DIR/run" -name 'codex-app-server.*.pid' -o -name 'codex-app-server.*.port' -o -name 'codex-app-server.*.version' | wc -l | tr -d ' ')" -eq 0 ]
+    return
+  fi
   [ "$status" -eq 37 ]
   grep -Eq '^plain-codex <resume> <--last> <-C>' "$CALL_LOG"
   refute grep -q -- '--remote' "$CALL_LOG"
