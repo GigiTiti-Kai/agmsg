@@ -391,15 +391,21 @@ EOF
   local tui_pid_file="$TEST_PROJECT/tui.pid"
   local listener_pid_file="$TEST_PROJECT/listener.pid"
   local launcher="$TEST_PROJECT/fake-launcher"
+  local forward_server_term=1 listener_watch_parent=1
   local key pidfile server_pid listener_pid launcher_pid tui_pid monitor_status lock_owner
   _make_term_recording_launcher "$launcher"
   TEST_TUI_RELEASE_FILE="$gate"
   TEST_TUI_EXIT_FILE="$tui_exit"
   TEST_LISTENER_PID_FILE="$listener_pid_file"
 
+  if [ "$(uname -s)" = Linux ] && command -v setsid >/dev/null 2>&1; then
+    forward_server_term=0
+    listener_watch_parent=0
+  fi
+
   key="$(printf '%s\n%s' "$(cd "$TEST_PROJECT" && pwd -P)" scope-direct-term | ( . "$SCRIPTS/lib/hash.sh"; agmsg_sha1 ))"
   pidfile="$TEST_SKILL_DIR/run/codex-app-server.$key.pid"
-  env FAKE_FORWARD_SERVER_TERM=0 FAKE_LISTENER_WATCH_PARENT=0 \
+  env FAKE_FORWARD_SERVER_TERM="$forward_server_term" FAKE_LISTENER_WATCH_PARENT="$listener_watch_parent" \
     FAKE_LISTENER_PID_FILE="$listener_pid_file" \
     FAKE_TERM_LOG="$server_term" FAKE_SERVER_READY_FILE="$server_ready" \
     FAKE_LAUNCHER_TERM_LOG="$launcher_term" FAKE_LAUNCHER_READY_FILE="$launcher_ready" \
