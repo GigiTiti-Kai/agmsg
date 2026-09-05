@@ -126,6 +126,7 @@ fi
 # otherwise message receipt stops silently. The earlier echoes give the specific
 # reason + log path; this prints the one-line summary just before handoff.
 exec_plain_codex() {
+  local cleanup_status=0
   echo "agmsg: Codex monitor bridge unavailable - launching plain Codex. Real-time agmsg delivery is OFF this session (messages still queue; check your inbox manually). Likely cause: the Codex app-server interface changed in 0.142+. Fix in progress." >&2
   cd "$PROJECT" 2>/dev/null || true
   if [ -n "$INVOCATION_SCOPE" ]; then
@@ -135,7 +136,8 @@ exec_plain_codex() {
     esac
     tui_bg=$!
     if wait "$tui_bg"; then codex_status=0; else codex_status=$?; fi
-    cleanup_scoped_invocation
+    if cleanup_scoped_invocation; then cleanup_status=0; else cleanup_status=$?; fi
+    [ "$cleanup_status" -eq 0 ] || exit 1
     exit "$codex_status"
   fi
   case "$CODEX_COMMAND" in
@@ -159,6 +161,7 @@ PORT_FILE="$RUN_DIR/codex-app-server.$APP_SERVER_KEY.port"
 VERSION_FILE="$RUN_DIR/codex-app-server.$APP_SERVER_KEY.version"
 SCOPED_REQUEST_FILE="$RUN_DIR/codex-bridge-request.$APP_SERVER_KEY"
 server_bg=""
+server_pgid=""
 launcher_bg=""
 tui_bg=""
 SCOPED_LEASE_RESOURCE=""
@@ -174,21 +177,55 @@ scoped_job_is_running() {
   return 1
 }
 
+read_local_pgid() {
+  ps -o pgid= -p "$1" 2>/dev/null | tr -d '[:space:]'
+}
+
+scoped_group_is_running() {
+  [ -n "$1" ] \
+    && ps -eo pgid= 2>/dev/null \
+      | awk -v pgid="$1" '$1 == pgid { found=1 } END { exit !found }'
+}
+
+wait_for_scoped_group_exit() {
+  local pgid="$1" probe
+  for probe in $(seq 1 20); do
+    scoped_group_is_running "$pgid" || return 0
+    sleep 0.05
+  done
+  return 1
+}
+
 cleanup_scoped_invocation() {
   [ -n "${INVOCATION_SCOPE:-}" ] || return 0
   [ "$scoped_cleanup_done" -eq 0 ] || return 0
+  scoped_cleanup_done=1
 
-  local child_pid recorded_server_pid
-  for child_pid in "$server_bg" "$launcher_bg"; do
-    scoped_job_is_running "$child_pid" && kill "$child_pid" 2>/dev/null || true
-  done
+  local child_pid recorded_server_pid server_group_owned=0 cleanup_status=0
+  if [ -n "$server_pgid" ] \
+    && scoped_job_is_running "$server_bg" \
+    && [ "$(read_local_pgid "$server_bg")" = "$server_pgid" ]; then
+    server_group_owned=1
+    kill -TERM -- "-$server_pgid" 2>/dev/null || true
+  elif scoped_job_is_running "$server_bg"; then
+    kill "$server_bg" 2>/dev/null || true
+  fi
+  scoped_job_is_running "$launcher_bg" && kill "$launcher_bg" 2>/dev/null || true
   for child_pid in "$server_bg" "$launcher_bg"; do
     [ -n "$child_pid" ] || continue
     wait "$child_pid" 2>/dev/null || true
   done
 
+  if [ "$server_group_owned" -eq 1 ] && ! wait_for_scoped_group_exit "$server_pgid"; then
+    kill -KILL -- "-$server_pgid" 2>/dev/null || true
+    if ! wait_for_scoped_group_exit "$server_pgid"; then
+      printf 'codex-monitor: owned app-server process group %s survived cleanup\n' "$server_pgid" >&2
+      cleanup_status=1
+    fi
+  fi
+
   recorded_server_pid="$(cat "$SERVER_PID" 2>/dev/null || true)"
-  if [ -n "$server_bg" ] && [ "$recorded_server_pid" = "$server_bg" ]; then
+  if [ "$cleanup_status" -eq 0 ] && [ -n "$server_bg" ] && [ "$recorded_server_pid" = "$server_bg" ]; then
     rm -f "$SERVER_LOG" "$SERVER_PID" "$PORT_FILE" "$VERSION_FILE" 2>/dev/null || true
   fi
   rm -f "$SCOPED_REQUEST_FILE" 2>/dev/null || true
@@ -197,7 +234,7 @@ cleanup_scoped_invocation() {
     scoped_lease_held=0
     agmsg_runtime_lock_release "$SCOPED_LEASE_RESOURCE" "$$" || true
   fi
-  scoped_cleanup_done=1
+  return "$cleanup_status"
 }
 
 terminate_scoped_invocation() {
@@ -206,8 +243,10 @@ terminate_scoped_invocation() {
     kill "$tui_bg" 2>/dev/null || true
   fi
   [ -z "$tui_bg" ] || wait "$tui_bg" 2>/dev/null || true
-  cleanup_scoped_invocation
-  exit "$signal_status"
+  if cleanup_scoped_invocation; then
+    exit "$signal_status"
+  fi
+  exit 1
 }
 
 CODEX_VERSION="$("$REAL_CODEX" --version 2>/dev/null || true)"
@@ -297,8 +336,29 @@ if [ -z "$PORT" ]; then
   # holds the whole test file open until the CI timeout. This app-server is
   # built to outlive its caller -- that is what the pidfile and the reuse checks
   # below are for -- so it is exactly the shape that keeps the pipe open.
-  "$REAL_CODEX" app-server --listen "ws://127.0.0.1:0" >>"$SERVER_LOG" 2>&1 3>&- 4>&- &
-  server_bg="$!"
+  if [ -n "$INVOCATION_SCOPE" ] && [ "$(uname -s)" = Linux ] && command -v setsid >/dev/null 2>&1; then
+    setsid "$REAL_CODEX" app-server --listen "ws://127.0.0.1:0" >>"$SERVER_LOG" 2>&1 3>&- 4>&- &
+    server_bg="$!"
+    monitor_pgid="$(read_local_pgid "$$")"
+    for _ in $(seq 1 20); do
+      scoped_job_is_running "$server_bg" || break
+      observed_pgid="$(read_local_pgid "$server_bg")"
+      if [ -n "$monitor_pgid" ] && [ "$observed_pgid" = "$server_bg" ] && [ "$observed_pgid" != "$monitor_pgid" ]; then
+        server_pgid="$observed_pgid"
+        break
+      fi
+      sleep 0.05
+    done
+    if [ -z "$server_pgid" ]; then
+      echo "codex-monitor: scoped app-server did not enter an owned process group" >&2
+      scoped_job_is_running "$server_bg" && kill "$server_bg" 2>/dev/null || true
+      wait "$server_bg" 2>/dev/null || true
+      exit 1
+    fi
+  else
+    "$REAL_CODEX" app-server --listen "ws://127.0.0.1:0" >>"$SERVER_LOG" 2>&1 3>&- 4>&- &
+    server_bg="$!"
+  fi
   echo "$server_bg" > "$SERVER_PID"
   # codex 0.144+ colorizes this banner even when stdout is a redirected file
   # (NO_COLOR is ignored), so strip ANSI SGR sequences before matching.
@@ -368,8 +428,10 @@ if [ -n "$INVOCATION_SCOPE" ]; then
   esac
   tui_bg=$!
   if wait "$tui_bg"; then codex_status=0; else codex_status=$?; fi
-  cleanup_scoped_invocation
-  exit "$codex_status"
+  if cleanup_scoped_invocation; then
+    exit "$codex_status"
+  fi
+  exit 1
 fi
 case "$CODEX_COMMAND" in
   codex)

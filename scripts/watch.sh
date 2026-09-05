@@ -580,6 +580,34 @@ _held_elsewhere_without() {
   printf '%s' "$out"
 }
 
+_pair_available() {
+  local pair_team="$1" pair_agent="$2" pair_state
+  pair_state="$(actas_lock_state "$pair_team" "$pair_agent" "$SESSION_ID" 2>/dev/null || echo free)"
+  case "$pair_state" in
+    other:*)
+      if [ -n "$ACTIVE_NAME" ]; then
+        watch_log "${pair_team}/${pair_agent} is now held by session ${pair_state#other:}."
+        watch_log "this watcher no longer owns that role and is stopping."
+        watch_log "messages for it stay unread and reach the session that claimed it."
+        exit 0
+      fi
+      if ! _held_elsewhere_has "${pair_team}/${pair_agent}"; then
+        HELD_ELSEWHERE="${HELD_ELSEWHERE:+$HELD_ELSEWHERE
+}${pair_team}/${pair_agent}"
+        echo "agmsg watch: ${pair_team}/${pair_agent} was claimed by session ${pair_state#other:}; not serving it while they hold it." >&2
+      fi
+      return 1
+      ;;
+    *)
+      if _held_elsewhere_has "${pair_team}/${pair_agent}"; then
+        HELD_ELSEWHERE="$(_held_elsewhere_without "${pair_team}/${pair_agent}")"
+        echo "agmsg watch: ${pair_team}/${pair_agent} is unheld again; serving it here." >&2
+      fi
+      return 0
+      ;;
+  esac
+}
+
 while true; do
   # The installation changed under us (#684). Say it on STDOUT, not stderr:
   # stdout is the delivery channel the session is reading, and this watcher's
@@ -628,50 +656,7 @@ while true; do
     # Only the lock file is read here, not the whole subscription set: losing a
     # pair is the half a running process can detect for the price of a file
     # read. Gaining one is the caller's job, at the point it creates the team.
-    pair_state="$(actas_lock_state "$pair_team" "$pair_agent" "$SESSION_ID" 2>/dev/null || echo free)"
-    case "$pair_state" in
-      other:*)
-        if [ -n "$ACTIVE_NAME" ]; then
-          # This watcher exists to serve exactly this role and no longer owns
-          # it. Stop -- and say so: stderr is the only place a reason survives,
-          # and a watcher that ends without one is indistinguishable from one
-          # that crashed.
-          watch_log "${pair_team}/${pair_agent} is now held by session ${pair_state#other:}."
-          watch_log "this watcher no longer owns that role and is stopping."
-          watch_log "messages for it stay unread and reach the session that claimed it."
-          exit 0
-        fi
-        # Broad subscription: this watcher serves other roles too, so skip the
-        # pair rather than ending the process -- exiting here would take down a
-        # whole session's delivery because one of its roles moved elsewhere.
-        #
-        # Skipped FOR AS LONG AS someone else holds it, not permanently. When
-        # the holder goes away the lock reads free again and this watcher takes
-        # the pair back, which is the same rule the startup filter uses (a
-        # stale lock is free). Dropping it for good would be worse: the role is
-        # still registered to this project, so nobody would deliver for it
-        # until the session restarted.
-        #
-        # Announced on each transition, not each cycle -- a per-cycle message
-        # would bury the log, and announcing only the first time would make a
-        # second departure invisible.
-        if ! _held_elsewhere_has "${pair_team}/${pair_agent}"; then
-          HELD_ELSEWHERE="${HELD_ELSEWHERE:+$HELD_ELSEWHERE
-}${pair_team}/${pair_agent}"
-          echo "agmsg watch: ${pair_team}/${pair_agent} was claimed by session ${pair_state#other:}; not serving it while they hold it." >&2
-        fi
-        continue
-        ;;
-      *)
-        # Free or ours. If we had stepped aside for it, say that we are taking
-        # it back -- otherwise the log shows a role leaving and never returning,
-        # which reads as a permanent drop.
-        if _held_elsewhere_has "${pair_team}/${pair_agent}"; then
-          HELD_ELSEWHERE="$(_held_elsewhere_without "${pair_team}/${pair_agent}")"
-          echo "agmsg watch: ${pair_team}/${pair_agent} is unheld again; serving it here." >&2
-        fi
-        ;;
-    esac
+    _pair_available "$pair_team" "$pair_agent" || continue
     # Per team: with a store per team, "one team has no store yet" is a
     # normal state, and a single check outside this loop would silence
     # delivery for every OTHER team as well.
@@ -692,6 +677,10 @@ while true; do
     [ -n "$READ_CURSOR" ] || READ_CURSOR=0
     OUT="$(storage_watch_after "$READ_CURSOR" "$pair_team:$pair_agent" 2>/dev/null || true)"
     if [ -n "$OUT" ]; then
+    # Ownership can move after the cycle-start check while storage is read.
+    # Re-check before publishing anything, and once more before consuming the
+    # cursor, so a stale watcher cannot hide a message it did not deliver.
+    _pair_available "$pair_team" "$pair_agent" || continue
     # The quote is held in a variable, never written as \' in the pattern: bash 3.2
     # (macOS /bin/bash) keeps the backslash of a \' REPLACEMENT, so the inline form
     # doubles a quote into \'\' there while producing '' on bash 4+. Same shape as
@@ -750,6 +739,7 @@ while true; do
       DELIVERED_IDS+=("$id")
     done <<< "$ROWS"
     if [ -n "$FINAL_CURSOR" ]; then
+      _pair_available "$pair_team" "$pair_agent" || continue
       # Bash 3 with `set -u` treats an empty array expansion as unbound. A
       # cursor-only page is valid, so advance it without optional IDs in that
       # case (and preserve exact delivered IDs when there are any).
