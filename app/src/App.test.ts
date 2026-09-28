@@ -1,14 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
   actasSpawnArgs,
+  actionFailedToast,
+  deleteTeamForceToast,
+  deleteTeamToast,
   hasUnsafeDropPath,
   joinDroppedPaths,
+  purgeMessagesToast,
+  renameTeamToast,
   resolveFileDropTarget,
   shellPaneFrom,
   shellSplitStillValid,
   shellTabStillValid,
   shouldShowOutdatedBanner,
   shouldSuppressClickAfterDrag,
+  shouldClearModalOnClose,
+  teamActionInvocation,
   type LoginShellInfo,
 } from "./App";
 
@@ -238,5 +245,99 @@ describe("resolveFileDropTarget", () => {
   it("returns null when there's no active window to fall back to", () => {
     // e.g. Team Room is showing (active === "room"), no panes at all.
     expect(resolveFileDropTarget(null, windows, "room", null)).toBeNull();
+  });
+});
+
+describe("teamActionInvocation", () => {
+  // #1479: the sidebar's team context menu (Rename/Delete team/Delete
+  // messages) must call the right agmsg command with the right args — a
+  // wrong mapping here would silently run the wrong destructive action.
+  it("maps rename to agmsg_rename_team with the old and new team names", () => {
+    expect(teamActionInvocation("renameTeam", "old-team", { nextName: "new-team" })).toEqual({
+      command: "agmsg_rename_team",
+      args: { oldTeam: "old-team", newTeam: "new-team" },
+    });
+  });
+
+  it("maps delete team to agmsg_delete_team with just the team", () => {
+    expect(teamActionInvocation("deleteTeam", "my-team")).toEqual({
+      command: "agmsg_delete_team",
+      args: { team: "my-team" },
+    });
+  });
+
+  it("maps delete messages to agmsg_purge_team_messages, not agmsg_delete_team", () => {
+    expect(teamActionInvocation("purgeMessages", "my-team")).toEqual({
+      command: "agmsg_purge_team_messages",
+      args: { team: "my-team" },
+    });
+  });
+
+  // #1493: escalating a refused --delete must add --force AND keep
+  // --purge-messages independently opt-in, never on by default.
+  it("maps the force-delete escalation to agmsg_delete_team_force with purgeMessages defaulting to false", () => {
+    expect(teamActionInvocation("deleteTeamForce", "my-team")).toEqual({
+      command: "agmsg_delete_team_force",
+      args: { team: "my-team", purgeMessages: false },
+    });
+  });
+
+  it("maps the force-delete escalation with the purge-messages checkbox checked", () => {
+    expect(teamActionInvocation("deleteTeamForce", "my-team", { purgeMessages: true })).toEqual({
+      command: "agmsg_delete_team_force",
+      args: { team: "my-team", purgeMessages: true },
+    });
+  });
+});
+
+describe("shouldClearModalOnClose", () => {
+  it("clears when the modal is still the one that opened the confirm", () => {
+    expect(shouldClearModalOnClose({ kind: "deleteTeam" }, "deleteTeam")).toBe(true);
+  });
+
+  it("does not clear when onConfirm already swapped in a different modal", () => {
+    // Regression (#1484 review): deleting the LAST team reopens the
+    // first-run "create a team" modal from inside onDeleteTeam via
+    // settleActiveTeam. ConfirmModal's own onClose fires right after and,
+    // without this guard, would stomp the new modal back to null.
+    const reopenedModal: { kind: string; firstRun: boolean } = { kind: "team", firstRun: true };
+    expect(shouldClearModalOnClose(reopenedModal, "deleteTeam")).toBe(false);
+  });
+
+  it("is a no-op against an already-null modal", () => {
+    expect(shouldClearModalOnClose(null, "deleteTeam")).toBe(false);
+  });
+});
+
+describe("completion toast builders", () => {
+  // #1484 review, round 3: rename/delete-team/delete-messages had no
+  // feedback at all once their modal had already closed. Each builder
+  // returns the i18n key + vars (not a rendered string) so this stays
+  // testable without a translation context — the actual t() call happens
+  // at push time, inside the component.
+  it("builds the rename-team toast from the old and new names", () => {
+    expect(renameTeamToast("A", "B")).toEqual({ key: "toast.renameTeam", vars: { from: "A", to: "B" } });
+  });
+
+  it("builds the plain delete-team toast from just the team name", () => {
+    expect(deleteTeamToast("my-team")).toEqual({ key: "toast.deleteTeam", vars: { team: "my-team" } });
+  });
+
+  it("builds the force-delete toast with the removed member count", () => {
+    expect(deleteTeamForceToast("my-team", 3)).toEqual({
+      key: "toast.deleteTeamForce",
+      vars: { team: "my-team", count: 3 },
+    });
+  });
+
+  it("builds the purge-messages toast from the team name", () => {
+    expect(purgeMessagesToast("my-team")).toEqual({ key: "toast.purgeMessages", vars: { team: "my-team" } });
+  });
+
+  it("builds the generic failure toast from the raw reason", () => {
+    expect(actionFailedToast("Team 'my-team' is actively synced; refusing to delete or purge its data.")).toEqual({
+      key: "toast.actionFailed",
+      vars: { reason: "Team 'my-team' is actively synced; refusing to delete or purge its data." },
+    });
   });
 });

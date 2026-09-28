@@ -21,6 +21,7 @@ import {
   AgentModal,
   AppUserModal,
   ConfirmModal,
+  DeleteTeamModal,
   MAX_TERMINAL_FONT_SIZE,
   MIN_TERMINAL_FONT_SIZE,
   NewTeamModal,
@@ -228,6 +229,9 @@ type Modal =
   | { kind: "appuser"; auto: boolean }
   | { kind: "rename"; current: string }
   | { kind: "leave"; name: string }
+  | { kind: "renameTeam"; current: string }
+  | { kind: "deleteTeam"; name: string }
+  | { kind: "purgeMessages"; name: string }
   | { kind: "settings" }
   | { kind: "closeWindow"; windowId: string }
   | { kind: "closePane"; paneId: string }
@@ -334,6 +338,79 @@ export function shouldShowOutdatedBanner<T>(
   return coreOutdated != null && !updatingCore && !dismissed;
 }
 
+// Which agmsg script the sidebar's team context menu (#1479) runs for each
+// action, and with what arguments — extracted as a pure function so the
+// menu-to-command wiring is unit-testable without mounting the app or a real
+// Tauri backend. Argument keys are camelCase to match how Tauri maps them
+// onto each command's snake_case Rust parameters.
+export type TeamMenuAction = "renameTeam" | "deleteTeam" | "deleteTeamForce" | "purgeMessages";
+export function teamActionInvocation(
+  action: TeamMenuAction,
+  team: string,
+  opts?: { nextName?: string; purgeMessages?: boolean },
+): { command: string; args: Record<string, string | boolean> } {
+  switch (action) {
+    case "renameTeam":
+      return { command: "agmsg_rename_team", args: { oldTeam: team, newTeam: opts?.nextName ?? "" } };
+    case "deleteTeam":
+      return { command: "agmsg_delete_team", args: { team } };
+    // #1493: force-removes remaining members (an app-created team always has
+    // at least its app-user) before deleting. Not yet on main as of this
+    // writing (core branch fix-1493-delete-force, pending final review) —
+    // the calling shape follows the confirmed core design and needs no further
+    // reconciling once it lands.
+    case "deleteTeamForce":
+      return {
+        command: "agmsg_delete_team_force",
+        args: { team, purgeMessages: opts?.purgeMessages ?? false },
+      };
+    case "purgeMessages":
+      return { command: "agmsg_purge_team_messages", args: { team } };
+  }
+}
+
+// Whether a modal-closing call that fires after its own async action
+// settles should actually null out the modal slot — false when something
+// else already put a DIFFERENT modal there in the meantime. Two ways that
+// happens: (a) the action's own side effect swaps modals while still in
+// flight (deleting the last team reopens the first-run "create a team"
+// modal from inside onDeleteTeam/settleActiveTeam), or (b) the user closes
+// this modal early — closing no longer waits for the action to finish
+// (#1484 review, round 2: run_script has no timeout) — and opens an
+// unrelated one before the original action's own completion handler runs.
+// Either way, a stale, unconditional close would clobber whatever is
+// showing now. `current` is read as the latest pending state via a
+// functional setModal updater, not a stale closure, so this always sees
+// what's actually there.
+export function shouldClearModalOnClose(current: { kind: string } | null, ownKind: string): boolean {
+  return current?.kind === ownKind;
+}
+
+// A completion notice (#1484 review, round 3: rename/delete-team/delete-
+// messages gave no feedback at all once their modal had already closed;
+// round 6: shares the same top-of-window .notice-banner the startup
+// install/update notices use, not a separate floating toast). Each builder
+// returns the i18n key + interpolation vars rather than a rendered string,
+// so the wording itself stays in the i18n files and this stays testable
+// without a translation context. `pushCompletionNotice` (below, inside App)
+// does the actual t() call at push time.
+export type ToastSpec = { key: string; vars?: Record<string, string | number> };
+export function renameTeamToast(from: string, to: string): ToastSpec {
+  return { key: "toast.renameTeam", vars: { from, to } };
+}
+export function deleteTeamToast(team: string): ToastSpec {
+  return { key: "toast.deleteTeam", vars: { team } };
+}
+export function deleteTeamForceToast(team: string, removedCount: number): ToastSpec {
+  return { key: "toast.deleteTeamForce", vars: { team, count: removedCount } };
+}
+export function purgeMessagesToast(team: string): ToastSpec {
+  return { key: "toast.purgeMessages", vars: { team } };
+}
+export function actionFailedToast(reason: string): ToastSpec {
+  return { key: "toast.actionFailed", vars: { reason } };
+}
+
 export default function App() {
   const { t } = useTranslation();
   // Set when a startup call that the whole app depends on (loading teams)
@@ -379,6 +456,34 @@ export default function App() {
   const [target, setTarget] = useState<string>("");
   const [draft, setDraft] = useState<string>("");
   const [modal, setModal] = useState<Modal>(null);
+  // Rename/delete-team/delete-messages completion notice — same
+  // .notice-banner the startup install/update notices use (#1484 review,
+  // round 6), not a separate floating toast. `success` auto-dismisses after
+  // a few seconds (still closeable early); `error` (only ever pushed when
+  // the dialog reporting it was already closed — see onTeamActionDismissedFailure
+  // below) stays until closed by hand. `id` disambiguates its own
+  // auto-dismiss timer from a NEWER notice that has already replaced it by
+  // the time that timer fires.
+  const [completionNotice, setCompletionNotice] = useState<{
+    id: number;
+    message: string;
+    kind: "success" | "error";
+  } | null>(null);
+  const completionNoticeIdRef = useRef(0);
+  const pushCompletionNotice = useCallback(
+    (kind: "success" | "error", spec: ToastSpec) => {
+      const id = ++completionNoticeIdRef.current;
+      setCompletionNotice({ id, message: t(spec.key, spec.vars), kind });
+    },
+    [t],
+  );
+  useEffect(() => {
+    if (!completionNotice || completionNotice.kind !== "success") return;
+    const timer = window.setTimeout(() => {
+      setCompletionNotice((cur) => (cur?.id === completionNotice.id ? null : cur));
+    }, 3000);
+    return () => window.clearTimeout(timer);
+  }, [completionNotice]);
   const [newMenu, setNewMenu] = useState(false);
   const [cmdName, setCmdName] = useState("agmsg");
   const [spawnTypes, setSpawnTypes] = useState<AgentType[]>([]);
@@ -472,6 +577,9 @@ export default function App() {
   const [roomMenu, setRoomMenu] = useState<{ x: number; y: number } | null>(null);
   // Same idea, over the app-user chat pane's own header: { x, y }.
   const [chatMenu, setChatMenu] = useState<{ x: number; y: number } | null>(null);
+  // Right-click context menu over a sidebar team row: { name, x, y }. `name`
+  // is whichever team was right-clicked, not necessarily the active `team`.
+  const [teamMenu, setTeamMenu] = useState<{ name: string; x: number; y: number } | null>(null);
 
   // Closes every context/dropdown menu (opening a second one while a
   // first is still open used to stack both — right-clicking a different
@@ -486,6 +594,7 @@ export default function App() {
     setWindowMenu(null);
     setRoomMenu(null);
     setChatMenu(null);
+    setTeamMenu(null);
     setRailTeamMenu(false);
   }, []);
   // The two menus opened by clicking a trigger button (rather than
@@ -896,19 +1005,26 @@ export default function App() {
       ?.scrollIntoView({ block: "nearest" });
   }, [team, sidebarCollapsed]);
 
-  // On team change: load members + the most recent history page. Prompt to
-  // add an app-user if missing.
-  useEffect(() => {
-    if (!team) return;
-    setDeselected(new Set()); // reset the room filter when switching teams
+  // The most recent history page for `t`, replacing whatever's currently
+  // shown — used both on team switch and after purging a team's messages
+  // (the same reset a stale page would otherwise leave behind).
+  const loadRoomMessages = useCallback((t: string) => {
     setMessages([]);
     setHasMoreHistory(true);
-    invoke<Message[]>("agmsg_messages", { team, limit: ROOM_PAGE_SIZE })
+    return invoke<Message[]>("agmsg_messages", { team: t, limit: ROOM_PAGE_SIZE })
       .then((msgs) => {
         setMessages(msgs);
         setHasMoreHistory(msgs.length >= ROOM_PAGE_SIZE);
       })
       .catch(console.error);
+  }, []);
+
+  // On team change: load members + the most recent history page. Prompt to
+  // add an app-user if missing.
+  useEffect(() => {
+    if (!team) return;
+    setDeselected(new Set()); // reset the room filter when switching teams
+    loadRoomMessages(team);
     loadMembers(team)
       .then((m) => {
         if (
@@ -919,7 +1035,7 @@ export default function App() {
         }
       })
       .catch(console.error);
-  }, [team, loadMembers]);
+  }, [team, loadMembers, loadRoomMessages]);
 
   // Live team-room updates; inject into a matching pane.
   useEffect(() => {
@@ -1701,6 +1817,92 @@ export default function App() {
     [team, loadMembers, detachPane],
   );
 
+  // Where to land when the currently active team disappears from `teams`
+  // (deleted, or renamed out from under itself): the same fallback the boot
+  // effect above uses — the localStorage-remembered team if it still
+  // exists, else the first remaining team, else back to the first-run
+  // "create a team" flow if none are left at all.
+  const settleActiveTeam = useCallback(
+    (loadedTeams: string[], removedName: string) => {
+      if (team !== removedName) return;
+      if (loadedTeams.length === 0) {
+        setTeam("");
+        setModal({ kind: "team", firstRun: true });
+        return;
+      }
+      const lastTeam = localStorage.getItem(LAST_TEAM_KEY);
+      setTeam(lastTeam && loadedTeams.includes(lastTeam) ? lastTeam : loadedTeams[0]);
+    },
+    [team],
+  );
+
+  const onRenameTeam = useCallback(
+    async (current: string, next: string) => {
+      const { command, args } = teamActionInvocation("renameTeam", current, { nextName: next });
+      await invoke(command, args);
+      await loadTeams();
+      if (team === current) setTeam(next);
+      // Guarded the same way as deleteTeam's onClose: closing the modal
+      // early (while this is still in flight, #1484 review round 2) and
+      // opening a different one before this resolves must not have this
+      // stale completion clobber it back to null.
+      setModal((cur) => (shouldClearModalOnClose(cur, "renameTeam") ? null : cur));
+      pushCompletionNotice("success", renameTeamToast(current, next));
+    },
+    [team, loadTeams, pushCompletionNotice],
+  );
+
+  // Delete/purge confirmation already happened in the UI (DeleteTeamModal /
+  // ConfirmModal); the CLI's own refusal reason (members remain, an active
+  // remote binding, the jsonl storage driver) comes back as run_script's Err
+  // and is shown as-is by the modal's err state.
+  const onDeleteTeam = useCallback(
+    async (name: string) => {
+      const { command, args } = teamActionInvocation("deleteTeam", name);
+      await invoke(command, args);
+      const loadedTeams = await loadTeams();
+      settleActiveTeam(loadedTeams, name);
+      pushCompletionNotice("success", deleteTeamToast(name));
+    },
+    [loadTeams, settleActiveTeam, pushCompletionNotice],
+  );
+
+  // #1493 escalation: only reachable after onDeleteTeam above has already
+  // failed with membersRemainCount (DeleteTeamModal gates showing the
+  // "delete with members" button on that, and hands back the count it
+  // already extracted from that refusal for the notice below).
+  const onDeleteTeamForce = useCallback(
+    async (name: string, purgeMessages: boolean, memberCount: number) => {
+      const { command, args } = teamActionInvocation("deleteTeamForce", name, { purgeMessages });
+      await invoke(command, args);
+      const loadedTeams = await loadTeams();
+      settleActiveTeam(loadedTeams, name);
+      pushCompletionNotice("success", deleteTeamForceToast(name, memberCount));
+    },
+    [loadTeams, settleActiveTeam, pushCompletionNotice],
+  );
+
+  const onPurgeMessages = useCallback(
+    async (name: string) => {
+      const { command, args } = teamActionInvocation("purgeMessages", name);
+      await invoke(command, args);
+      if (name === team) await loadRoomMessages(team);
+      pushCompletionNotice("success", purgeMessagesToast(name));
+    },
+    [team, loadRoomMessages, pushCompletionNotice],
+  );
+
+  // Only reachable when a rename/delete-team/delete-messages modal was
+  // already dismissed (closed while busy) by the time its action rejects —
+  // there's no dialog left to show the reason in, so it surfaces as a
+  // (sticky, hand-dismissed) error notice instead (#1484 review, round 3).
+  // A refusal the dialog is still open to show (e.g. members remain) never
+  // reaches this.
+  const onTeamActionDismissedFailure = useCallback(
+    (message: string) => pushCompletionNotice("error", actionFailedToast(message)),
+    [pushCompletionNotice],
+  );
+
   const browseDir = useCallback(async (current: string): Promise<string | null> => {
     const picked = await openDialog({ directory: true, defaultPath: current || undefined });
     return typeof picked === "string" ? picked : null;
@@ -1902,15 +2104,21 @@ export default function App() {
         </div>
       )}
       {coreUpdateSucceeded && (
-        <div className="startup-success-banner">
+        <div className="notice-banner success">
           <span>{t("startupError.updateSucceeded", { version: coreUpdateSucceeded })}</span>
           <button onClick={() => setCoreUpdateSucceeded(null)}>{t("startupError.dismiss")}</button>
         </div>
       )}
       {startupError && (
-        <div className="startup-error-banner">
+        <div className="notice-banner error">
           <span>{startupError}</span>
           <button onClick={() => setStartupError(null)}>{t("startupError.dismiss")}</button>
+        </div>
+      )}
+      {completionNotice && (
+        <div className={`notice-banner ${completionNotice.kind}`}>
+          <span>{completionNotice.message}</span>
+          <button onClick={() => setCompletionNotice(null)}>{t("startupError.dismiss")}</button>
         </div>
       )}
       <div className="body">
@@ -2016,6 +2224,12 @@ export default function App() {
                       className={teamName === team ? "team-status-row active" : "team-status-row"}
                       title={`${teamName}: ${status} (open panes)`}
                       onClick={() => setTeam(teamName)}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        closeAllMenus();
+                        setTeamMenu({ name: teamName, x: e.clientX, y: e.clientY });
+                      }}
                     >
                       <span className={`team-status-dot status-${status}`} />
                     </button>
@@ -2073,6 +2287,12 @@ export default function App() {
                       className={teamName === team ? "team-status-row active" : "team-status-row"}
                       title={`${teamName}: ${status} (open panes)`}
                       onClick={() => setTeam(teamName)}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        closeAllMenus();
+                        setTeamMenu({ name: teamName, x: e.clientX, y: e.clientY });
+                      }}
                     >
                       <span className="team-status-slot">
                         <span className={`team-status-dot status-${status}`} />
@@ -2633,6 +2853,36 @@ export default function App() {
           onClose={() => setModal(null)}
         />
       )}
+      {modal?.kind === "renameTeam" && (
+        <RenameModal
+          current={modal.current}
+          onRename={onRenameTeam}
+          onClose={() => setModal((cur) => (shouldClearModalOnClose(cur, "renameTeam") ? null : cur))}
+          onDismissedFailure={onTeamActionDismissedFailure}
+        />
+      )}
+      {modal?.kind === "deleteTeam" && (
+        <DeleteTeamModal
+          title={t("modal.deleteTeam.title", { team: modal.name })}
+          body={t("modal.deleteTeam.body", { team: modal.name })}
+          confirmLabel={t("modal.deleteTeam.confirmLabel")}
+          onConfirm={() => onDeleteTeam(modal.name)}
+          onConfirmForce={(purgeMessages, memberCount) => onDeleteTeamForce(modal.name, purgeMessages, memberCount)}
+          onClose={() => setModal((cur) => (shouldClearModalOnClose(cur, "deleteTeam") ? null : cur))}
+          onDismissedFailure={onTeamActionDismissedFailure}
+        />
+      )}
+      {modal?.kind === "purgeMessages" && (
+        <ConfirmModal
+          title={t("modal.purgeMessages.title", { team: modal.name })}
+          body={t("modal.purgeMessages.body", { team: modal.name })}
+          confirmLabel={t("modal.purgeMessages.confirmLabel")}
+          danger
+          onConfirm={() => onPurgeMessages(modal.name)}
+          onClose={() => setModal((cur) => (shouldClearModalOnClose(cur, "purgeMessages") ? null : cur))}
+          onDismissedFailure={onTeamActionDismissedFailure}
+        />
+      )}
       {modal?.kind === "settings" && (
         <SettingsModal
           onClose={() => setModal(null)}
@@ -2737,6 +2987,41 @@ export default function App() {
             </div>
           );
         })()}
+
+      {teamMenu && (
+        <div
+          className="ctx-menu"
+          style={{ left: teamMenu.x, top: teamMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            onClick={() => {
+              setModal({ kind: "renameTeam", current: teamMenu.name });
+              setTeamMenu(null);
+            }}
+          >
+            {t("ctxMenu.team.rename")}
+          </button>
+          <button
+            className="danger"
+            onClick={() => {
+              setModal({ kind: "deleteTeam", name: teamMenu.name });
+              setTeamMenu(null);
+            }}
+          >
+            {t("ctxMenu.team.delete")}
+          </button>
+          <button
+            className="danger"
+            onClick={() => {
+              setModal({ kind: "purgeMessages", name: teamMenu.name });
+              setTeamMenu(null);
+            }}
+          >
+            {t("ctxMenu.team.deleteMessages")}
+          </button>
+        </div>
+      )}
 
       {paneMenu &&
         (() => {
