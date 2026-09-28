@@ -154,6 +154,36 @@ export function shellSplitStillValid(
   return windows.some((w) => w.id === windowId && w.team === requestedTeam);
 }
 
+// A window's `team` never changes after creation (see Window's own doc) —
+// EXCEPT that renaming the team itself must repoint every one of its
+// existing tabs at the new name, or the sidebar (which only ever renders
+// `w.team === team` for the CURRENT, now-renamed team) hides them: the PTYs
+// stay alive, but their tabs vanish from the tab bar with no way back to
+// them short of a restart. Pure so onRenameTeam's rekeying is
+// unit-testable without mounting the app or a real Tauri backend.
+export function renameTeamInWindows<T extends Pick<Window, "team">>(
+  windows: readonly T[],
+  oldTeam: string,
+  newTeam: string,
+): T[] {
+  return windows.map((w) => (w.team === oldTeam ? { ...w, team: newTeam } : w));
+}
+
+// Moves one team-keyed entry to its new key, leaving every other entry
+// untouched — used for lastActiveTabByTeam (below) and any other bit of
+// state keyed by team name a rename needs to follow. A no-op (same
+// reference back) when oldTeam never had an entry, so callers can apply it
+// unconditionally without a guard of their own.
+export function renameTeamKey<T>(
+  byTeam: Readonly<Record<string, T>>,
+  oldTeam: string,
+  newTeam: string,
+): Record<string, T> {
+  if (!(oldTeam in byTeam)) return byTeam;
+  const { [oldTeam]: value, ...rest } = byTeam;
+  return { ...rest, [newTeam]: value as T };
+}
+
 // C0 control characters (\u0000-\u001f) and DEL (\u007f) — legal in a
 // macOS/Linux filename, but this string is about to be written straight
 // into a PTY as literal input. A newline in a filename would submit
@@ -1851,14 +1881,48 @@ export default function App() {
     async (current: string, next: string) => {
       const { command, args } = teamActionInvocation("renameTeam", current, { nextName: next });
       await invoke(command, args);
-      await loadTeams();
-      if (team === current) setTeam(next);
+
+      // Everything from here on assumes the rename itself already
+      // succeeded — never move this above the invoke, or into a
+      // try/finally that would also run when the core refused it (#1500
+      // review, round 2). A window's `team` and lastActiveTabByTeam's keys
+      // are otherwise untouched by rename-team.sh (it only repoints the
+      // core's own records) — without this, every tab spawned under the
+      // old name stays tagged with it, and the sidebar (which only ever
+      // renders `w.team === team` for the current, now-renamed team) hides
+      // them: PTYs stay alive, tabs just vanish (found in live testing).
+      // Done before loadTeams(), not after: if that read then fails, the
+      // app must not still be pointing at a name that no longer exists on
+      // disk (a retry with the old name would fail confusingly).
+      setWindows((prev) => renameTeamInWindows(prev, current, next));
+      lastActiveTabByTeam.current = renameTeamKey(lastActiveTabByTeam.current, current, next);
+      if (team === current) {
+        // The team-change layout effect below writes
+        // lastActiveTabByTeam[prevTeamRef.current] = active on every
+        // `team` change, BEFORE updating prevTeamRef itself — if it still
+        // held the old name when setTeam(next) triggers that effect, its
+        // own write would resurrect the very key just removed above.
+        // Setting it here, in the same step as setTeam, means that write
+        // lands on the new key instead (an idempotent no-op).
+        prevTeamRef.current = next;
+        setTeam(next);
+      }
       // Guarded the same way as deleteTeam's onClose: closing the modal
       // early (while this is still in flight, #1484 review round 2) and
       // opening a different one before this resolves must not have this
       // stale completion clobber it back to null.
       setModal((cur) => (shouldClearModalOnClose(cur, "renameTeam") ? null : cur));
       pushCompletionNotice("success", renameTeamToast(current, next));
+
+      // The rename already succeeded — a failure here just means the
+      // sidebar's team list is stale until the next refresh, not that the
+      // rename failed, so it gets its own notice rather than surfacing as
+      // if renaming itself had been refused.
+      try {
+        await loadTeams();
+      } catch (e) {
+        pushCompletionNotice("error", actionFailedToast(String(e)));
+      }
     },
     [team, loadTeams, pushCompletionNotice],
   );
