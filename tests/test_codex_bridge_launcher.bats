@@ -25,6 +25,20 @@ setup() {
   setup_test_env
   export SKILL_DIR="$TEST_SKILL_DIR"
   export RUN_DIR="$SKILL_DIR/run"; mkdir -p "$RUN_DIR"
+  # #1254: the launcher now requires AGMSG_CODEX_SEAT_KEY (inherited from
+  # codex-monitor.sh's own environment in real use) and refuses to run
+  # without it. Generated fresh per TEST (never one fixed literal for the
+  # whole file): the dispatcher/child locks and the request file are keyed by
+  # this value now, not by $PROJ's hash, so a shared literal across tests
+  # would let one test's leftover lock or request file (teardown races a
+  # loaded runner) collide with the next test's -- exactly the isolation
+  # $PROJ's own per-test uniqueness used to give for free. Every launcher
+  # invocation below is a plain child process of this test, so it inherits
+  # this export without needing to repeat it at each of the ~20 call sites.
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/drivers/types/codex/_seat-key.sh"
+  export AGMSG_CODEX_SEAT_KEY="$(_agmsg_codex_seat_key_new)"
+  unset AGMSG_ROLE_SESSION_OWNER
   export PROJ="$TEST_SKILL_DIR/proj"; mkdir -p "$PROJ"
   bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
 
@@ -108,10 +122,6 @@ _launcher_bridge_pids() {
     [ -f "$f" ] || continue
     cat "$f" 2>/dev/null
   done
-  for f in "$RUN_DIR"/codex-bridge-lease.*; do
-    [ -f "$f" ] || continue
-    printf '%s\n' "${f##*.}"
-  done
 }
 
 # A test's own kill/wait sequence reaches the dispatcher and the short-lived
@@ -143,18 +153,47 @@ put_record() {
   SKILL_DIR="$TEST_SKILL_DIR" bash -c \
     'source "$1/lib/role-session.sh"; agmsg_role_session_record "$2" "$3" "$4" "$5" "$6"' \
     _ "$SCRIPTS" "$@"
+  request_file="$RUN_DIR/codex-bridge-request.$AGMSG_CODEX_SEAT_KEY"
+  request_pair=""
+  if [ -f "$request_file" ]; then
+    IFS=$'\t' read -r _rt _rthread _rapp _rteam _rname < "$request_file" || true
+    [ -n "${_rteam:-}" ] && [ -n "${_rname:-}" ] && request_pair="$_rteam"$'\t'"$_rname"
+  fi
+  if [ -z "$request_pair" ] || [ "$request_pair" = "$1"$'\t'"$2" ]; then
+    printf 'codex\t%s\tws://127.0.0.1:1\t%s\t%s\n' "$3" "$1" "$2" \
+      > "$request_file"
+  fi
 }
 
 write_request() {
-  local thread="$1" hash
-  hash=$(SKILL_DIR="$TEST_SKILL_DIR" bash -c \
-    'source "$1/lib/hash.sh"; printf "%s" "$2" | agmsg_sha1' _ "$SCRIPTS" "$PROJ")
-  printf 'codex\t%s\tws://127.0.0.1:1\n' "$thread" > "$RUN_DIR/codex-bridge-request.$hash"
+  local thread="$1"
+  local pair_team="${2:-}" pair_name="${3:-}"
+  # #1254: the request file is keyed by AGMSG_CODEX_SEAT_KEY now, not a
+  # project hash -- this file's setup() exports one fixed key for the whole
+  # suite, which every launcher invocation below inherits.
+  printf 'codex\t%s\tws://127.0.0.1:1\t%s\t%s\n' "$thread" "$pair_team" "$pair_name" \
+    > "$RUN_DIR/codex-bridge-request.$AGMSG_CODEX_SEAT_KEY"
 }
 
-write_scoped_request() {
-  local key="$1" thread="$2" url="$3"
-  printf 'codex\t%s\t%s\n' "$thread" "$url" > "$RUN_DIR/codex-bridge-request.$key"
+# Start the dispatcher with enough lifetime to remain eligible under a loaded
+# runner, but stop it as soon as the asynchronous bridge launch is observable.
+# A short foreground lifetime followed by a capture wait is not equivalent:
+# once the lifetime process exits, the dispatcher is no longer allowed to spawn
+# the role child that creates CAPTURE.
+run_launcher_until_capture() { # [ENV=VALUE ...]
+  sleep 30 3>&- & local parent=$!
+  env "$@" bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent" >/dev/null 2>&1 3>&- &
+  local dispatcher=$! seen=0 i
+  for i in {1..200}; do
+    if [ -f "$CAPTURE" ]; then seen=1; break; fi
+    sleep 0.1
+  done
+  kill "$parent" 2>/dev/null || true
+  wait "$parent" 2>/dev/null || true
+  # Retire the lifetime first and let the dispatcher observe that boundary.
+  # Killing the dispatcher first can strand the detached role child it spawned.
+  wait "$dispatcher" 2>/dev/null || true
+  [ "$seen" -eq 1 ]
 }
 
 # Drive the launcher against a short-lived parent, blocking until it exits. fd 3
@@ -180,6 +219,15 @@ run_launcher() {
   [ -f "$CAPTURE" ]
   grep -q -- "--thread rec-thread-1" "$CAPTURE"
   ! grep -q -- "--thread loaded" "$CAPTURE"
+}
+
+@test "launcher: passes the actas owner recorded by the claim" {
+  setup_live_owner "$RUN_DIR" owner-session
+  export AGMSG_CODEX_BRIDGE_APP_SERVER="ws://127.0.0.1:1"
+  bash "$SCRIPTS/actas-claim.sh" "$PROJ" codex alice owner-session >/dev/null
+  run_launcher
+  [ -f "$CAPTURE" ]
+  grep -q -- "--owner owner-session" "$CAPTURE"
 }
 
 @test "launcher: passes the active storage override as a workspace root" {
@@ -208,6 +256,18 @@ run_launcher() {
   [ "$(cat "$RUN_DIR/codex-bridge.team.alice.thread" 2>/dev/null)" = "rec-thread-1" ]
 }
 
+@test "launcher: ignores a stale request app-server URL and binds to its live server" {
+  put_record team alice rec-thread-1 "$PROJ" codex
+  printf 'codex\trec-thread-1\tws://127.0.0.1:2\tteam\talice\n' \
+    > "$RUN_DIR/codex-bridge-request.$AGMSG_CODEX_SEAT_KEY"
+  run_launcher
+
+  [ -f "$CAPTURE" ]
+  grep -q -- "--app-server ws://127.0.0.1:1" "$CAPTURE"
+  refute grep -q -- "--app-server ws://127.0.0.1:2" "$CAPTURE"
+  [ "$(cat "$RUN_DIR/codex-bridge.team.alice.appserver" 2>/dev/null)" = "ws://127.0.0.1:1" ]
+}
+
 @test "launcher: replaces a stale role pidfile with the spawned bridge pid" {
   put_record team alice rec-thread-1 "$PROJ" codex
   export MOCK_BRIDGE_SLEEP=3
@@ -227,23 +287,25 @@ run_launcher() {
   wait "$driver_pid" 2>/dev/null || true
 }
 
-@test "launcher: starts one bridge per recorded role and thread (#150 phase 2)" {
+@test "launcher: dispatches only the role recorded for this seat (#1280)" {
   bash "$SCRIPTS/join.sh" team bob codex "$PROJ" >/dev/null
   put_record team alice thread-alice "$PROJ" codex
   put_record team bob thread-bob "$PROJ" codex
   run_launcher
 
-  local i lines=0
-  for i in {1..30}; do
-    if [ -f "$CAPTURE" ]; then
-      lines=$(wc -l < "$CAPTURE" | tr -d ' ')
-    fi
-    [ "$lines" -ge 2 ] && break
-    sleep 0.1
-  done
-  [ "$lines" -ge 2 ]
+  [ -f "$CAPTURE" ]
   grep -q -- $'--pair team\talice --thread thread-alice' "$CAPTURE"
-  grep -q -- $'--pair team\tbob --thread thread-bob' "$CAPTURE"
+  ! grep -q -- $'--pair team\tbob --thread thread-bob' "$CAPTURE"
+}
+
+@test "launcher: preserves team and name when request app-server is empty" {
+  put_record team alice thread-empty-app-server "$PROJ" codex
+  printf 'codex\tthread-empty-app-server\t\tteam\talice\n' \
+    > "$RUN_DIR/codex-bridge-request.$AGMSG_CODEX_SEAT_KEY"
+  run_launcher
+
+  [ -f "$CAPTURE" ]
+  grep -q -- $'--pair team\talice --thread thread-empty-app-server' "$CAPTURE"
 }
 
 @test "launcher: only one dispatcher runs per project" {
@@ -274,13 +336,16 @@ run_launcher() {
 @test "launcher: stale dispatcher reclamation remains singleton under contention" {
   put_record team alice thread-alice "$PROJ" codex
   export MOCK_BRIDGE_SLEEP=8
-  local hash lock_db
-  hash=$(printf '%s' "$PROJ" | bash -c 'source "$1"; agmsg_sha1' _ "$SCRIPTS/lib/hash.sh")
+  # #1254: the dispatcher lock is keyed by AGMSG_CODEX_SEAT_KEY now, not a
+  # project hash -- seed the stale row under that same resource name so this
+  # test still simulates what it means to (a crashed dispatcher's lock left
+  # behind for THIS seat).
+  local lock_db
   lock_db="$TEST_SKILL_DIR/db/messages.db"
-  sqlite3 "$lock_db" "CREATE TABLE locks(resource TEXT PRIMARY KEY, owner_pid INTEGER NOT NULL, acquired_at TEXT NOT NULL); INSERT INTO locks VALUES('codex-dispatcher:$hash', 99999999, datetime('now'));"
+  sqlite3 "$lock_db" "CREATE TABLE locks(resource TEXT PRIMARY KEY, owner_pid INTEGER NOT NULL, acquired_at TEXT NOT NULL); INSERT INTO locks VALUES('codex-dispatcher:$AGMSG_CODEX_SEAT_KEY', 99999999, datetime('now'));"
   # A crash from the former two-directory implementation can leave this behind.
   # The transactional lock protocol must not depend on that legacy reaper.
-  mkdir "$RUN_DIR/codex-bridge-dispatcher.$hash.reap"
+  mkdir "$RUN_DIR/codex-bridge-dispatcher.$AGMSG_CODEX_SEAT_KEY.reap"
   export AGMSG_TEST_DISPATCHER_STALE_BARRIER="$TEST_SKILL_DIR/stale-observed"
   sleep 10 3>&- & local parent_a=$!
   sleep 10 3>&- & local parent_b=$!
@@ -304,234 +369,15 @@ run_launcher() {
   wait "$parent_b" 2>/dev/null || true
 }
 
-@test "launcher: project request thread never overrides per-role recorded threads (#150 phase 2)" {
+@test "launcher: request pair selects the matching recorded thread (#150 phase 2)" {
   bash "$SCRIPTS/join.sh" team bob codex "$PROJ" >/dev/null
   put_record team alice thread-alice "$PROJ" codex
   put_record team bob thread-bob "$PROJ" codex
-  write_request thread-bob
+  write_request thread-bob team bob
   run_launcher
 
-  grep -q -- $'--pair team\talice --thread thread-alice' "$CAPTURE"
   grep -q -- $'--pair team\tbob --thread thread-bob' "$CAPTURE"
-  ! grep -q -- $'--pair team\talice --thread thread-bob' "$CAPTURE"
-}
-
-@test "launcher: two scoped servers route distinct roles to exact app servers" {
-  bash "$SCRIPTS/join.sh" team bob codex "$PROJ" >/dev/null
-  put_record team alice thread-A "$PROJ" codex
-  put_record team bob thread-B "$PROJ" codex
-  export MOCK_BRIDGE_SLEEP=25
-  local key_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  local key_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-  local url_a=ws://127.0.0.1:1111 url_b=ws://127.0.0.1:2222
-  local server_a server_b launcher_a launcher_b
-  sleep 30 3>&- & server_a=$!
-  sleep 30 3>&- & server_b=$!
-  printf '%s' "$server_a" > "$RUN_DIR/codex-app-server.$key_a.pid"
-  printf '%s' "$server_b" > "$RUN_DIR/codex-app-server.$key_b.pid"
-  write_scoped_request "$key_a" thread-A "$url_a"
-  write_scoped_request "$key_b" thread-B "$url_b"
-
-  AGMSG_CODEX_APP_SERVER_KEY="$key_a" \
-    bash "$LAUNCHER" codex "$PROJ" "$url_a" "$server_a" >/dev/null 2>&1 3>&- &
-  launcher_a=$!
-  AGMSG_CODEX_APP_SERVER_KEY="$key_b" \
-    bash "$LAUNCHER" codex "$PROJ" "$url_b" "$server_b" >/dev/null 2>&1 3>&- &
-  launcher_b=$!
-
-  wait_for_file_contains "$CAPTURE" 'thread-A'
-  wait_for_file_contains "$CAPTURE" 'thread-B'
-  grep -Fq -- $'--pair team\talice --thread thread-A --app-server ws://127.0.0.1:1111' "$CAPTURE"
-  grep -Fq -- $'--pair team\tbob --thread thread-B --app-server ws://127.0.0.1:2222' "$CAPTURE"
-  refute grep -Fq -- $'--pair team\talice --thread thread-A --app-server ws://127.0.0.1:2222' "$CAPTURE"
-  refute grep -Fq -- $'--pair team\tbob --thread thread-B --app-server ws://127.0.0.1:1111' "$CAPTURE"
-  kill -0 "$launcher_a"
-  kill -0 "$launcher_b"
-
-  kill "$server_a" "$server_b" 2>/dev/null || true
-  wait "$server_a" 2>/dev/null || true
-  wait "$server_b" 2>/dev/null || true
-  wait "$launcher_a" 2>/dev/null || true
-  wait "$launcher_b" 2>/dev/null || true
-}
-
-@test "launcher: scope exit leaves peer delivery alive" {
-  bash "$SCRIPTS/join.sh" team bob codex "$PROJ" >/dev/null
-  put_record team alice thread-A "$PROJ" codex
-  put_record team bob thread-B "$PROJ" codex
-  export MOCK_BRIDGE_SLEEP=25
-  local key_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  local key_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-  local url_a=ws://127.0.0.1:1111 url_b=ws://127.0.0.1:2222
-  local server_a server_b launcher_a launcher_b bob_bridge
-  sleep 30 3>&- & server_a=$!
-  sleep 30 3>&- & server_b=$!
-  printf '%s' "$server_a" > "$RUN_DIR/codex-app-server.$key_a.pid"
-  printf '%s' "$server_b" > "$RUN_DIR/codex-app-server.$key_b.pid"
-  write_scoped_request "$key_a" thread-A "$url_a"
-  write_scoped_request "$key_b" thread-B "$url_b"
-
-  AGMSG_CODEX_APP_SERVER_KEY="$key_a" \
-    bash "$LAUNCHER" codex "$PROJ" "$url_a" "$server_a" >/dev/null 2>&1 3>&- &
-  launcher_a=$!
-  AGMSG_CODEX_APP_SERVER_KEY="$key_b" \
-    bash "$LAUNCHER" codex "$PROJ" "$url_b" "$server_b" >/dev/null 2>&1 3>&- &
-  launcher_b=$!
-  wait_for_file_contains "$CAPTURE" 'thread-A'
-  wait_for_file_contains "$CAPTURE" 'thread-B'
-  grep -Fq -- $'--pair team\talice --thread thread-A --app-server ws://127.0.0.1:1111' "$CAPTURE"
-  grep -Fq -- $'--pair team\tbob --thread thread-B --app-server ws://127.0.0.1:2222' "$CAPTURE"
-  bob_bridge="$(cat "$RUN_DIR/codex-bridge.team.bob.pid")"
-
-  kill "$server_a"
-  wait "$server_a" 2>/dev/null || true
-  wait_for_pid_exit "$launcher_a"
-  wait "$launcher_a" 2>/dev/null || true
-  kill -0 "$launcher_b"
-  kill -0 "$server_b"
-  kill -0 "$bob_bridge"
-
-  kill "$server_b" 2>/dev/null || true
-  wait "$server_b" 2>/dev/null || true
-  wait "$launcher_b" 2>/dev/null || true
-}
-
-@test "launcher: scoped role seat transfers between exact servers" {
-  put_record team alice thread-A "$PROJ" codex
-  export MOCK_BRIDGE_SLEEP=25
-  local key_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  local key_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-  local url_a=ws://127.0.0.1:1111 url_b=ws://127.0.0.1:2222
-  local server_a server_b launcher_a launcher_b old_bridge new_bridge
-  local project_hash pair_hash lock_resource lock_owner i
-  sleep 30 3>&- & server_a=$!
-  sleep 30 3>&- & server_b=$!
-  printf '%s' "$server_a" > "$RUN_DIR/codex-app-server.$key_a.pid"
-  printf '%s' "$server_b" > "$RUN_DIR/codex-app-server.$key_b.pid"
-  write_scoped_request "$key_a" thread-A "$url_a"
-  write_scoped_request "$key_b" thread-B "$url_b"
-
-  AGMSG_CODEX_APP_SERVER_KEY="$key_a" \
-    bash "$LAUNCHER" codex "$PROJ" "$url_a" "$server_a" >/dev/null 2>&1 3>&- &
-  launcher_a=$!
-  AGMSG_CODEX_APP_SERVER_KEY="$key_b" \
-    bash "$LAUNCHER" codex "$PROJ" "$url_b" "$server_b" >/dev/null 2>&1 3>&- &
-  launcher_b=$!
-  wait_for_file_contains "$CAPTURE" 'thread-A'
-  grep -Fq -- $'--pair team\talice --thread thread-A --app-server ws://127.0.0.1:1111' "$CAPTURE"
-  old_bridge="$(cat "$RUN_DIR/codex-bridge.team.alice.pid")"
-  kill -0 "$old_bridge"
-
-  put_record team alice thread-B "$PROJ" codex
-  for i in {1..150}; do
-    grep -Fq -- $'--pair team\talice --thread thread-B --app-server ws://127.0.0.1:2222' "$CAPTURE" 2>/dev/null && break
-    sleep 0.1
-  done
-  grep -Fq -- $'--pair team\talice --thread thread-B --app-server ws://127.0.0.1:2222' "$CAPTURE"
-  wait_for_pid_exit "$old_bridge"
-  new_bridge="$(cat "$RUN_DIR/codex-bridge.team.alice.pid")"
-  [ "$new_bridge" != "$old_bridge" ]
-  kill -0 "$new_bridge"
-  [ "$(cat "$RUN_DIR/codex-bridge.team.alice.thread")" = thread-B ]
-  [ "$(cat "$RUN_DIR/codex-bridge.team.alice.appserver")" = "$url_b" ]
-  [ "$(_wait_exact_role_count "$PROJ" alice 1)" -eq 1 ]
-
-  source "$SCRIPTS/lib/hash.sh"
-  project_hash="$(printf '%s' "$PROJ" | agmsg_sha1)"
-  pair_hash="$(printf '%s' $'team\talice' | agmsg_sha1)"
-  lock_resource="codex-child:$project_hash:$pair_hash"
-  lock_owner="$(source "$SCRIPTS/lib/storage.sh"; agmsg_runtime_lock_owner "$lock_resource")"
-  [ -n "$lock_owner" ]
-  kill -0 "$lock_owner"
-
-  kill "$server_a" "$server_b" 2>/dev/null || true
-  wait "$server_a" 2>/dev/null || true
-  wait "$server_b" 2>/dev/null || true
-  wait "$launcher_a" 2>/dev/null || true
-  wait "$launcher_b" 2>/dev/null || true
-}
-
-@test "launcher: scoped child survives one empty identity read after role lock" {
-  put_record team alice thread-A "$PROJ" codex
-  export MOCK_BRIDGE_SLEEP=3
-  local key=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  local url=ws://127.0.0.1:1111
-  local counter="$TEST_SKILL_DIR/identity-count"
-  local real_identities="$SCRIPTS/identities.real.sh"
-  local server launcher_pid i capture_count
-
-  mv "$SCRIPTS/identities.sh" "$real_identities"
-  cat > "$SCRIPTS/identities.sh" <<'EOF'
-#!/usr/bin/env bash
-count=0
-[ ! -f "$AGMSG_TEST_IDENTITY_COUNTER" ] || count="$(cat "$AGMSG_TEST_IDENTITY_COUNTER")"
-count=$((count + 1))
-printf '%s' "$count" > "$AGMSG_TEST_IDENTITY_COUNTER"
-[ "$count" -eq 2 ] && exit 0
-exec "$AGMSG_TEST_IDENTITIES_REAL" "$@"
-EOF
-  chmod +x "$SCRIPTS/identities.sh"
-  export AGMSG_TEST_IDENTITY_COUNTER="$counter"
-  export AGMSG_TEST_IDENTITIES_REAL="$real_identities"
-
-  sleep 4 3>&- & server=$!
-  printf '%s' "$server" > "$RUN_DIR/codex-app-server.$key.pid"
-  write_scoped_request "$key" thread-A "$url"
-
-  AGMSG_CODEX_APP_SERVER_KEY="$key" \
-    bash "$LAUNCHER" codex "$PROJ" "$url" "$server" $'team\talice' >/dev/null 2>&1 3>&- &
-  launcher_pid=$!
-
-  for i in {1..30}; do
-    capture_count="$(grep -Fc -- $'--pair team\talice --thread thread-A --app-server ws://127.0.0.1:1111' "$CAPTURE" 2>/dev/null || true)"
-    [ "${capture_count:-0}" -eq 1 ] && break
-    sleep 0.1
-  done
-
-  [ "$(cat "$counter")" -ge 3 ]
-  [ "${capture_count:-0}" -eq 1 ]
-
-  kill "$server" 2>/dev/null || true
-  wait "$server" 2>/dev/null || true
-  wait "$launcher_pid" 2>/dev/null || true
-}
-
-@test "launcher: malformed scoped requests stay unread and start no bridge" {
-  put_record team alice thread-A "$PROJ" codex
-  local key=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  local url=ws://127.0.0.1:1111
-  local request="$RUN_DIR/codex-bridge-request.$key"
-  local before payload server
-  local payloads=(
-    __missing__
-    $'codex\tthread-A'
-    $'codex\tthread-A\tws://127.0.0.1:1111\textra'
-    $'codex\t\tws://127.0.0.1:1111'
-    $'claude-code\tthread-A\tws://127.0.0.1:1111'
-    $'codex\tthread-A\tws://127.0.0.1:2222'
-  )
-
-  for payload in "${payloads[@]}"; do
-    rm -f "$CAPTURE" "$request"
-    before=""
-    if [ "$payload" != __missing__ ]; then
-      printf '%s' "$payload" > "$request"
-      before="$(cat "$request")"
-    fi
-
-    sleep 0.7 3>&- & server=$!
-    printf '%s' "$server" > "$RUN_DIR/codex-app-server.$key.pid"
-    run env AGMSG_CODEX_APP_SERVER_KEY="$key" \
-      bash "$LAUNCHER" codex "$PROJ" "$url" "$server" $'team\talice'
-    [ "$status" -eq 0 ]
-    [ ! -e "$CAPTURE" ]
-    if [ "$payload" = __missing__ ]; then
-      [ ! -e "$request" ]
-    else
-      [ "$(cat "$request")" = "$before" ]
-    fi
-    wait "$server" 2>/dev/null || true
-  done
+  ! grep -q -- $'--pair team\talice --thread thread-alice' "$CAPTURE"
 }
 
 @test "launcher: role record update keeps child scoped to the same pair" {
@@ -650,11 +496,10 @@ wait_for_child_count() {
   wait "$parent" 2>/dev/null || true
 }
 
-@test "launcher: the identity cache still sees a role added mid-loop (#466)" {
+@test "launcher: a role added mid-loop is used only after its request arrives (#466)" {
   # The poll no longer re-runs identities.sh every tick; it serves a cache
-  # guarded on the team configs' mtimes. This is the test that fails if that
-  # guard never invalidates: a role joined while the dispatcher is already
-  # looping has to be picked up anyway.
+  # guarded on the team configs' mtimes. A role joined while the dispatcher is
+  # already looping is eligible only when this seat's request names it.
   put_record team alice thread-alice "$PROJ" codex
   export MOCK_BRIDGE_SLEEP=20
   sleep 25 3>&- & local parent=$!
@@ -673,6 +518,9 @@ wait_for_child_count() {
   sleep 3
   bash "$SCRIPTS/join.sh" team bob codex "$PROJ" >/dev/null
   put_record team bob thread-bob "$PROJ" codex
+  # SessionStart publishes the seat's narrowed pair. Until that request is
+  # written, the project-wide identity is deliberately ignored.
+  write_request thread-bob team bob
   for i in {1..100}; do
     grep -q -- $'--pair team\tbob' "$CAPTURE" 2>/dev/null && break
     sleep 0.1
@@ -703,19 +551,14 @@ wait_for_child_count() {
 
   put_record team alice thread-msys "$PROJ" codex
 
-  sleep 6 3>&- & local p=$!
-  MSYSTEM=MINGW64 PATH="$stubdir:$PATH" \
-    bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$p" >/dev/null 2>&1 3>&- || true
-  wait "$p" 2>/dev/null || true
-  local i
-  for i in {1..30}; do [ -f "$CAPTURE" ] && break; sleep 0.1; done
+  run_launcher_until_capture MSYSTEM=MINGW64 PATH="$stubdir:$PATH" || true
 
   # A bridge was launched at all -- this is what the whole class costs on Windows.
   [ -f "$CAPTURE" ] || { echo "no bridge was started under a blind tasklist"; false; }
   grep -q -- '--thread thread-msys' "$CAPTURE"
 }
 
-@test "launcher: windows-native starts the bridge (#567)" {
+@test "launcher: windows-native starts the bridge (#1161)" {
   skip_unless_windows "the point is the real tasklist and the real MSYS pid space"
   # The counterpart to codex-monitor's windows-native test, and the half #582
   # does NOT fix: reaching the bridged handoff is not the same as delivering a
@@ -725,11 +568,7 @@ wait_for_child_count() {
   # started. Real tasklist, no stub.
   put_record team alice thread-win "$PROJ" codex
 
-  sleep 6 3>&- & local p=$!
-  bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$p" >/dev/null 2>&1 3>&- || true
-  wait "$p" 2>/dev/null || true
-  local i
-  for i in {1..30}; do [ -f "$CAPTURE" ] && break; sleep 0.1; done
+  run_launcher_until_capture || true
 
   [ -f "$CAPTURE" ] || { echo "no bridge was started on native Windows"; false; }
   grep -q -- '--thread thread-win' "$CAPTURE"
@@ -777,9 +616,9 @@ _count_exact_role_bridges() { # <project> <name>
 # -- so the caller was handed a number that nothing had ever waited for. That is
 # the half of #984 needing no superset fixture, and it is why all five call sites
 # could fail, not only the superset one.
-_wait_exact_role_count() { # <project> <name> <want>
-  local i seen
-  for i in {1..100}; do
+_wait_exact_role_count() { # <project> <name> <want> [tries]
+  local i seen tries="${4:-100}"
+  for ((i = 0; i < tries; i++)); do
     seen="$(_count_exact_role_bridges "$1" "$2")"
     [ "$seen" = "$3" ] && { printf '%s' "$seen"; return 0; }
     sleep 0.1
@@ -801,8 +640,8 @@ _wait_exact_role_count() { # <project> <name> <want>
 # a precondition cannot be established, say which count was actually reached and
 # fail, rather than continuing into an assertion that no longer means what it
 # says.
-_require_launcher_bridge() { # <project> <name>
-  local seen; seen="$(_wait_exact_role_count "$1" "$2" 1)"
+_require_launcher_bridge() { # <project> <name> [tries]
+  local seen; seen="$(_wait_exact_role_count "$1" "$2" 1 "${3:-}")"
   [ "$seen" = 1 ] && return 0
   echo "the launcher never reached one {$2} bridge (saw $seen), so this test could not create the orphan it is about" >&2
   return 1
@@ -839,8 +678,12 @@ _spawn_fake() { # <project> <pair...>
   # never reach: this is the one assertion here that goes red if the waiter is
   # ever rewritten to return its `want` instead of what it saw. Every other
   # check in this file passes under that rewrite, which is the shape of the
-  # defect being fixed (#984). It costs the waiter's full 10s by design.
-  [ "$(_wait_exact_role_count "$PROJ" bob 1)" -eq 0 ]
+  # defect being fixed (#984). It costs the waiter's full wait by design --
+  # shortened to 5 tries (0.5s) here because the exact-{bob} count is STATIC
+  # for this whole wait: nothing spawned above or below can ever make it
+  # something other than 0, so ending early cannot turn a later true into a
+  # false pass.
+  [ "$(_wait_exact_role_count "$PROJ" bob 1 5)" -eq 0 ]
   # One that IS {alice} counts, with the other three still running.
   _spawn_fake "$PROJ" "team${tab}alice"; local solo=$FAKE_PID
   [ "$(_wait_exact_role_count "$PROJ" alice 1)" -eq 1 ]
@@ -860,9 +703,11 @@ _spawn_fake() { # <project> <pair...>
   # and the test carried on to delete pidfiles that did not exist and assert
   # against a bridge started during the wait. Green, with #937 never exercised.
   #
-  # Costs the waiter's full sweep by design -- an exhausted gate is what is
-  # being measured, so it cannot be short-circuited.
-  run _require_launcher_bridge "$PROJ" alice
+  # An exhausted gate is what is being measured, so its OUTCOME cannot be
+  # short-circuited -- but the exact-{alice} count is STATIC for this whole
+  # wait (no launcher runs here at all, so nothing can ever make it 1), so the
+  # sweep itself is shortened to 5 tries (0.5s).
+  run _require_launcher_bridge "$PROJ" alice 5
   [ "$status" -ne 0 ]
   # And it must say WHICH count it reached: an exhausted gate that fails with a
   # bare non-zero tells the next reader nothing about why.
@@ -1034,4 +879,101 @@ _fake_alice_lease() { # sets FAKE_PID once its lease file exists
   sleep 3
   kill -0 "$victim"
   kill "$victim" "$disp" "$parent" 2>/dev/null || true; wait "$disp" 2>/dev/null || true; wait "$victim" 2>/dev/null || true
+}
+
+# --- Windows start token: the lease schema must admit the source
+# codex-bridge.js writeLease() records on Windows, where /proc does not exist and
+# the only `ps` likely to be on PATH (MSYS's) rejects -o outright, so both POSIX
+# sources yield an empty token and the bridge can never publish a lease at all.
+#
+# _read_lease is the reaper's ONLY gate on a lease, so its accept/reject set is
+# the contract. These exercise it directly -- the pattern test_remote.bats uses
+# for _remote_endpoint_display -- rather than through the reaper: the reaper
+# needs a spawnable bridge and a live pid, which is exactly what does not work on
+# Git Bash (#567), and the schema question has nothing to do with either. Kept
+# out of the `windows-native` filter deliberately: nothing here runs PowerShell,
+# so these belong on every leg, not only the Windows one. ---
+_lease_verdict() { # <startsrc> <start> -> prints accept|reject
+  local h40=0123456789abcdef0123456789abcdef01234567
+  printf 'v=1\nproject=%s\npairs=%s\nhost=h\npid=123\nstart=%s\nstartsrc=%s\n' \
+    "$h40" "$h40" "$2" "$1" > "$TEST_SKILL_DIR/lease-under-test"
+  bash -c '
+    pattern="/^_read_lease() {/,/^}/p"
+    eval "$(sed -n "$pattern" "$1")"
+    _read_lease "$2" && echo accept || echo reject
+  ' _ "$LAUNCHER" "$TEST_SKILL_DIR/lease-under-test" 2>/dev/null
+}
+
+@test "launcher: the lease schema admits a pwsh start token" {
+  [ "$(_lease_verdict pwsh 639231441791462826)" = accept ]
+}
+
+@test "launcher: a pwsh lease whose token is not an integer is rejected, fail-closed" {
+  # .NET Ticks is a bare integer. Anything else under that label is a lease this
+  # side did not write, and a doubtful lease must never authorise a kill.
+  [ "$(_lease_verdict pwsh 6392314.5)" = reject ]
+  [ "$(_lease_verdict pwsh '')" = reject ]
+}
+
+@test "launcher: an unrecognised startsrc is rejected, fail-closed" {
+  # wmic is here on purpose, not as an arbitrary bad value: WMIC's CreationDate
+  # was the faster candidate and was deliberately NOT adopted, because a per-side
+  # "WMIC, else PowerShell" order lets the writer and the reaper resolve different
+  # sources for the same process whenever only one of them can reach wmic.exe.
+  # Rejecting the label pins that decision, so reintroducing it fails loudly.
+  [ "$(_lease_verdict wmic 20260824041348.411807+540)" = reject ]
+  [ "$(_lease_verdict bogus 123)" = reject ]
+}
+
+@test "launcher: proc and ps leases still parse (start-token regression)" {
+  [ "$(_lease_verdict proc 396341883)" = accept ]
+  [ "$(_lease_verdict ps 'Sun Aug 24 04:00:00 2026')" = accept ]
+  # ps stays exempt from the integer check (its token is a human date string
+  # whose punctuation varies by platform); proc does not.
+  [ "$(_lease_verdict proc abc)" = reject ]
+}
+
+_run_start_token() { # <pid> -> runs _start_token in a subshell
+  run bash -c '
+    pattern="/^_agmsg_is_windows() {/,/^}/p;/^_start_token() {/,/^}/p"
+    eval "$(sed -n "$pattern" "$1")"
+    _start_token "$2"
+  ' _ "$LAUNCHER" "$1"
+}
+
+@test "launcher: a live pid yields a proc or ps start token on POSIX" {
+  skip_on_windows "Windows has its own source; see the windows-native case"
+  _run_start_token $$
+  [ "$status" -eq 0 ]
+  local tab; tab=$(printf '\t')
+  case "${output%%"$tab"*}" in proc|ps) ;; *) false ;; esac
+  [ -n "${output#*"$tab"}" ]
+}
+
+@test "launcher: CLANGARM uname selects the Windows start token path" {
+  local stubdir="$TEST_SKILL_DIR/clangarm-bin"
+  mkdir -p "$stubdir"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" CLANGARM64_NT-10.0' > "$stubdir/uname"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" 639231441791462826' > "$stubdir/powershell.exe"
+  chmod +x "$stubdir/uname" "$stubdir/powershell.exe"
+
+  PATH="$stubdir:$PATH" _run_start_token 123
+  [ "$status" -eq 0 ]
+  [ "$output" = $'pwsh\t639231441791462826' ]
+}
+
+@test "launcher: windows-native a live pid yields an integer pwsh start token" {
+  skip_unless_windows "PowerShell and the Windows pid space are the point"
+  # The pid must be the WINDOWS one. MSYS/Cygwin number processes in their own
+  # space -- the same shell is MSYS pid 3994449 and winpid 19568 on our runner --
+  # and Get-Process only knows the latter, which is also the pid
+  # codex-bridge.js records as process.pid.
+  local winpid; winpid="$(cat /proc/$$/winpid)"
+  [ -n "$winpid" ]
+  _run_start_token "$winpid"
+  [ "$status" -eq 0 ]
+  local tab; tab=$(printf '\t')
+  [ "${output%%"$tab"*}" = pwsh ]
+  local tok="${output#*"$tab"}"
+  case "$tok" in ''|*[!0-9]*) false ;; esac
 }

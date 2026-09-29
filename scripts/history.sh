@@ -17,6 +17,19 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
 agmsg_storage_load
 
+# A seat that reads history as itself names its own pane if it is not named
+# (self-name.sh); see send.sh. Only when an agent is given: without one this
+# is a team-wide read by nobody in particular.
+if [ -n "$AGENT" ]; then
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/lib/self-name.sh"
+  agmsg_self_name_on_action "$TEAM" "$AGENT"
+  # Fix its own CLI session name once, early (self-rename.sh, #1081). Best-effort.
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/lib/self-rename.sh"
+  agmsg_self_rename_on_action "$TEAM" "$AGENT"
+fi
+
 # A history read must not create a store, so a team that has never been written
 # to has no file yet. Since the stores split per team that is the ordinary state
 # of a freshly joined team rather than a broken install, and it reads out the
@@ -57,7 +70,11 @@ trap 'rm -f "$_agmsg_rows_sql"' EXIT HUP INT TERM
   printf '%s' "${_arr//$_AGMSG_SQ/$_AGMSG_SQ$_AGMSG_SQ}"
   printf "');\n"
 } > "$_agmsg_rows_sql"
-ROWS=$(agmsg_sqlite ':memory:' < "$_agmsg_rows_sql")
+# Windows sqlite3.exe may treat redirected stdin as interactive input unless
+# batch mode is explicit, returning success without evaluating the SQL. Keep
+# the stdin path (it avoids command-line length limits) and make the mode
+# explicit on every platform.
+ROWS=$(agmsg_sqlite -batch ':memory:' < "$_agmsg_rows_sql")
 rm -f "$_agmsg_rows_sql"
 trap - EXIT HUP INT TERM
 
@@ -96,7 +113,7 @@ while IFS= read -r r; do
     printf '%s' "${uarr//$_AGMSG_SQ/$_AGMSG_SQ$_AGMSG_SQ}"
     printf "');\n"
   } > "$_agmsg_unread_sql"
-  ids=$(agmsg_sqlite ':memory:' < "$_agmsg_unread_sql")
+  ids=$(agmsg_sqlite -batch ':memory:' < "$_agmsg_unread_sql")
   rm -f "$_agmsg_unread_sql"
   trap - EXIT HUP INT TERM
   UNREAD_IDS+="$ids"$'\n'

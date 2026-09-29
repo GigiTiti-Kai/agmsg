@@ -107,6 +107,31 @@ test("none and age-v1 profiles share one seal/open registry", async () => {
   }
 });
 
+test("a missing age binary is reported as missing, not as an unsupported cipher", () => {
+  // Before #1487 this threw "age executable is unavailable" -- true, but
+  // reading as "this cipher is not supported", and silent about where `age`
+  // was even looked for.
+  const base = {
+    type: "sync_seal", envelope_v: 1, cipher: "age-v1", key_id: manifest.binding.key_id,
+    max_blob_bytes: 1_048_576, wire_id: manifest.binding.wire_id,
+    team_id: manifest.binding.team_id, protocol_version: 1,
+    projection: manifest.canonical_message,
+    recipients: [manifest.recipient_sets.team_a.recipient],
+  };
+  const originalAgeBin = process.env.AGMSG_AGE_BIN;
+  const missing = "/nonexistent/agmsg-test-age-binary";
+  try {
+    process.env.AGMSG_AGE_BIN = missing;
+    assert.throws(() => sealEnvelope(base), (error) =>
+      error.state === "unsupported_cipher" &&
+      error.message.includes(missing) &&
+      /PATH|AGMSG_AGE_BIN/u.test(error.message));
+  } finally {
+    if (originalAgeBin === undefined) delete process.env.AGMSG_AGE_BIN;
+    else process.env.AGMSG_AGE_BIN = originalAgeBin;
+  }
+});
+
 test("legacy messages remain discriminator-free while roster mutations use kind", async () => {
   const base = {
     type: "sync_seal",
@@ -461,4 +486,30 @@ test("canonical plaintext rejects lone surrogates and impossible timestamps", as
       from_agent: "😀".repeat(65) } }));
   assert.throws(() => sealEnvelope({ ...base,
     projection: { ...base.projection, from_agent: "😀".repeat(129) } }), /from_agent/u);
+});
+
+test("receive tolerates an unknown message field but still rejects a duplicate key", async () => {
+  // A future sender may add a field this version does not know about yet.
+  // Enters at the real open path (openEnvelope -> openNone -> parseCanonicalProjection),
+  // not at the validation helper directly, so this exercises what a peer on
+  // the wire actually sees.
+  const withUnknownField = Buffer.from(JSON.stringify({
+    ...manifest.canonical_message, subject: "future field",
+  })).toString("base64");
+  const projection = await openEnvelope({
+    envelope: { v: 1, cipher: "none", key_id: null, blob: withUnknownField },
+    max_blob_bytes: 1_048_576,
+  });
+  assert.deepEqual(projection, manifest.canonical_message);
+  assert.deepEqual(Object.keys(projection).sort(),
+    ["body", "created_at", "from_agent", "to_agent"]);
+
+  const withDuplicateKey = Buffer.from(
+    '{"body":"one","body":"two","created_at":"2026-07-20T06:30:00.000000Z",' +
+    '"from_agent":"leader","to_agent":"worker-1"}',
+  ).toString("base64");
+  await assert.rejects(openEnvelope({
+    envelope: { v: 1, cipher: "none", key_id: null, blob: withDuplicateKey },
+    max_blob_bytes: 1_048_576,
+  }), (error) => error.state === "malformed");
 });
