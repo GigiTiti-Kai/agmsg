@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { existsSync, readdirSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink,
   utimes, writeFile } from "node:fs/promises";
@@ -58,6 +59,7 @@ import {
   validateMembers,
   validateReadStatePage,
   validateResyncResult,
+  withTeamConfigLock,
   validateResyncStatus,
   verifyAgeSnapshot,
   verifyAgeHandoff,
@@ -80,6 +82,7 @@ const candidates = [
 ];
 
 const credentialId = "018f3f7e-0000-7000-8000-000000000020";
+const authorityFileOptions = { mode: 0o644 };
 
 test("a rotator provisions its confirmed snapshot at the server boundary", async () => {
   const root = await mkdtemp(join(tmpdir(), "agmsg-local-key-rotation-"));
@@ -147,7 +150,7 @@ test("a rotator provisions its confirmed snapshot at the server boundary", async
         capabilities: { write_allowed_ciphers: ["none", "age-v1"] },
         cipher_profile: "age-v1", connected_at: "2026-07-29T00:00:00Z",
         disconnected_at: null },
-    })}\n`);
+    })}\n`, authorityFileOptions);
     await writeFile(join(teamDir, "roster.jsonl"), [
       JSON.stringify({ type: "key_rotated", ...rotation,
         at: "2026-07-30T00:00:00.000000Z", server_seq: undefined }),
@@ -453,7 +456,8 @@ async function writeConnectedTeam(root, overrides = {}) {
     ...overrides,
   };
   await writeFile(join(root, "teams", "demo", "config.json"),
-    `${JSON.stringify({ name: "demo", agents: {}, remote_binding: remoteBinding }, null, 2)}\n`);
+    `${JSON.stringify({ name: "demo", agents: {}, remote_binding: remoteBinding }, null, 2)}\n`,
+    authorityFileOptions);
 }
 
 test("connected binding is a bounded non-writable nofollow authority", async () => {
@@ -1217,6 +1221,51 @@ test("explicit reprocess rejects an unbounded walk through duplicate server sequ
   }), /one server sequence to multiple wire ids/u);
 });
 
+test("scoped reprocess rejects an unbounded pending-count walk before applying anything (#1323 review)", async () => {
+  // The pending-count walk (scope set) runs BEFORE the bounded processing walk
+  // below it and shares its authenticatedSequenceSpace bound, but had no page
+  // limit of its own -- a driver that keeps answering has_more:true with a
+  // fabricated, ever-advancing server_seq/next_after would spin here forever,
+  // before the processing walk's own guard is ever reached. Each page here
+  // returns a new, validly-shaped, strictly-advancing candidate and never sets
+  // has_more:false, so the only thing that can stop this walk is its own
+  // bound.
+  const capabilities = {
+    protocol_version: 1, server_instance_id: config.server_instance_id,
+    team_id: config.remote_team_id, team_name: "demo", min_available_seq: "0",
+    current_seq: "2", next_sequence_boundary: "3", accepted_envelope_versions: [1],
+    write_allowed_ciphers: ["none"], policy_revision: "0", effective_from_seq: "1",
+    max_blob_bytes: "1048576", policy_history: [{ policy_revision: "0",
+      effective_from_seq: "1", accepted_envelope_versions: [1],
+      write_allowed_ciphers: ["none"] }],
+  };
+  let pageIndex = 0;
+  await assert.rejects(() => reprocessCycle(config, 1, {
+    healthCall: async () => ({ server_instance_id: config.server_instance_id, team_id: config.remote_team_id }),
+    requestCall: async () => capabilities,
+    driverCall: async () => {
+      pageIndex += 1;
+      // Hex, not decimal, padded to fill the full 12-char segment: a decimal
+      // counter would grow past 4 digits eventually and break UUID_V4's fixed
+      // width, which would stop this fixture's loop for an unrelated reason
+      // (an invalid id) rather than by the bound this test exists to prove.
+      const id = `550e8400-e29b-41d4-a716-${pageIndex.toString(16).padStart(12, "0")}`;
+      return [
+        { type: "sync_state", driver_generation: "018f3f7e-0000-7000-8000-000000000099",
+          transport_cursor: "2" },
+        { type: "sync_reprocess_candidate", server_seq: String(pageIndex), id,
+          server_received_at: "2026-07-22T11:00:00.000000Z",
+          envelope: { v: 1, cipher: "none", key_id: null, blob: "e30=" },
+          prior_status: "authentication_failed" },
+        { type: "sync_reprocess_page", next_after: `${pageIndex}:${id}`, has_more: true },
+      ];
+    },
+    evaluateCall: async () => ({ status: "authentication_failed", reason: "still blocked",
+      policy_revision: "0", local_security_revision: "0" }),
+    eventCall: async () => {}, logApplyCall: async () => {},
+  }, "malformed"), /pending count walk exceeds authenticated sequence space/u);
+});
+
 test("Stage-2 roster, update batches, and response pages are canonical", () => {
   const members = [{ member_id: "018f3f7e-0000-7000-8000-000000000010", name: "worker-1" }];
   assert.deepEqual(validateMembers(config, {
@@ -1854,7 +1903,7 @@ test("set-endpoint aligns the stored sync config's server_url with the moved bin
         remote_team_id: config.remote_team_id, protocol_version: 1,
         capabilities: { write_allowed_ciphers: ["none"] },
         cipher_profile: "none", connected_at: "2026-07-29T00:00:00Z",
-        disconnected_at: null } })}\n`);
+        disconnected_at: null } })}\n`, authorityFileOptions);
     const stored = { format_version: 1, local_team: "demo",
       server_url: "http://127.0.0.1:8787",
       server_instance_id: config.server_instance_id,
@@ -1863,7 +1912,7 @@ test("set-endpoint aligns the stored sync config's server_url with the moved bin
       local_security_history: [{ local_security_revision: "0",
         effective_from_seq: "1", minimum_security_mode: "plaintext-allowed" }] };
     await mkdir(join(root, "store", "remote-sync"), { recursive: true });
-    await writeFile(storedPath, JSON.stringify(stored));
+    await writeFile(storedPath, JSON.stringify(stored), authorityFileOptions);
     const capabilities = { protocol_version: 1,
       server_instance_id: config.server_instance_id,
       team_id: config.remote_team_id, team_name: "demo", min_available_seq: "0",
@@ -1931,7 +1980,8 @@ test("set-endpoint cannot land a stale alignment over a newer move (#739 interle
     process.env.AGMSG_SYNC_STORAGE_DIR = join(root, "store");
     await mkdir(join(root, "teams", "demo"), { recursive: true });
     await mkdir(join(root, "store", "remote-sync"), { recursive: true });
-    await writeFile(teamCfgPath, `${JSON.stringify(bindingFor("https://x.example", 2))}\n`);
+    await writeFile(teamCfgPath, `${JSON.stringify(bindingFor("https://x.example", 2))}\n`,
+      authorityFileOptions);
     const stored = { format_version: 1, local_team: "demo",
       server_url: "https://o.example",
       server_instance_id: config.server_instance_id,
@@ -1939,7 +1989,7 @@ test("set-endpoint cannot land a stale alignment over a newer move (#739 interle
       cipher_profile: "none",
       local_security_history: [{ local_security_revision: "0",
         effective_from_seq: "1", minimum_security_mode: "plaintext-allowed" }] };
-    await writeFile(storedPath, JSON.stringify(stored));
+    await writeFile(storedPath, JSON.stringify(stored), authorityFileOptions);
     const capabilities = { protocol_version: 1,
       server_instance_id: config.server_instance_id,
       team_id: config.remote_team_id, team_name: "demo", min_available_seq: "0",
@@ -1958,7 +2008,8 @@ test("set-endpoint cannot land a stale alignment over a newer move (#739 interle
     const staleOutcome = stale.catch((error) => error);
     while (releaseFetch === null) await new Promise((r) => setTimeout(r, 5));
     // B: moves the binding on to Y and completes its own alignment.
-    await writeFile(teamCfgPath, `${JSON.stringify(bindingFor("https://y.example", 3))}\n`);
+    await writeFile(teamCfgPath, `${JSON.stringify(bindingFor("https://y.example", 3))}\n`,
+      authorityFileOptions);
     await writeFile(storedPath, JSON.stringify({ ...stored, server_url: "https://y.example" }));
     releaseFetch();
     const outcome = await staleOutcome;
@@ -2194,6 +2245,49 @@ exit 7
   }
 });
 
+test("SIGTERM while this process holds the team config lock releases it before exit",
+  { timeout: 30_000 }, async () => {
+  // The leaked locks this guards against were never a crash: remote.sh's own
+  // "stop the old engine" path sends SIGTERM first (scripts/remote.sh), and a
+  // handler-less Node process drops a pending `finally` on SIGTERM exactly as
+  // it does on SIGKILL (measured separately, not assumed) -- so an ordinary
+  // stop mid-critical-section is exactly as lock-leak-prone as a hard kill.
+  // Real process, real signal: a handler installed on THIS test's process
+  // would answer a different question.
+  const root = await mkdtemp(join(tmpdir(), "agmsg-lock-sigterm-"));
+  const lockDir = join(root, "teams", "demo", ".config.lock");
+  const holderPath = `${lockDir}.holder`;
+  const scriptPath = join(root, "hold-lock.mjs");
+  const modulePath = fileURLToPath(new URL("../scripts/internal/remote-sync.mjs", import.meta.url));
+  await mkdir(dirname(lockDir), { recursive: true });
+  await writeFile(scriptPath,
+    `import { withTeamConfigLock } from ${JSON.stringify(modulePath)};\n` +
+    // A bare never-resolving promise has no libuv handle behind it, so it
+    // would not keep this process alive at all -- it would just run to
+    // completion and exit 0 with the lock still held, never reaching SIGTERM.
+    // The real held-lock window (an in-flight capabilities request, or the
+    // engine's own loop) always has one; this stands in for it.
+    "setInterval(() => {}, 1_000_000);\n" +
+    "withTeamConfigLock(\"demo\", () => new Promise(() => {})).catch(() => {});\n");
+  const child = spawn(process.execPath, [scriptPath],
+    { env: { ...process.env, AGMSG_SYNC_CONNECTION_DIR: root }, stdio: "ignore" });
+  try {
+    // Bounded: taking the lock is this child's first async step.
+    for (let attempt = 0; attempt < 200 && !existsSync(lockDir); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(existsSync(lockDir), "child never took the team config lock");
+    assert.ok(existsSync(holderPath), "child never wrote its holder");
+    child.kill("SIGTERM");
+    await once(child, "exit");
+    assert.ok(!existsSync(lockDir), "SIGTERM left the lock directory behind");
+    assert.ok(!existsSync(holderPath), "SIGTERM left the holder file behind");
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await rm(root, { recursive: true });
+  }
+});
+
 test("the storage driver that stops reading its input fails through its exit code, not the broken write",
   { timeout: 30_000 }, async (t) => {
   // The storage driver keeps its pipe: after evaluatePull() its input is
@@ -2393,6 +2487,10 @@ test("a staged input leaves nothing behind, whether the call succeeds or fails",
   const before = await residue();
 
   const root = await mkdtemp(join(tmpdir(), "agmsg-sync-driver-residue-"));
+  t.after(async () => {
+    if (!root.startsWith(tmpdir())) throw new Error("unsafe test root");
+    await rm(root, { recursive: true, force: true });
+  });
   const input = Array.from({ length: 8 }, (_, index) => ({ type: "probe", index }));
 
   const ok = (pidFile, helperFile) => `#!/usr/bin/env bash
@@ -2682,7 +2780,12 @@ async function withDriverEnvironment(t, root, script, buildCalls) {
 test("storage driver subprocess cannot observe HTTP or age identity secrets", async () => {
   const root = await mkdtemp(join(tmpdir(), "agmsg-sync-driver-env-"));
   const mock = join(root, "driver.sh");
+  // Same EPIPE race as the two stubs #759 fixed for #755: this one prints and
+  // exits without reading stdin, so a parent write/end that lands after exit
+  // hits a closed pipe and is reported as a driver failure. `cat` drains stdin
+  // first so the child stays alive until the parent has finished writing.
   await writeFile(mock, `#!/usr/bin/env bash
+cat >/dev/null
 [ -z "\${AGMSG_SYNC_TOKEN:-}" ] || exit 99
 [ -z "\${AGMSG_SYNC_TRUST_DIR:-}" ] || exit 95
 [ -z "\${AGMSG_AGE_IDENTITY:-}" ] || exit 98
