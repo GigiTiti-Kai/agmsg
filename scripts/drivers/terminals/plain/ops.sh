@@ -17,10 +17,17 @@ _plain_parse_id() {
   local id="$1"
   _PLAIN_EMULATOR=""; _PLAIN_TTY=""
   case "$id" in
-    iterm:/dev/ttys[0-9]*|terminal:/dev/ttys[0-9]*)
+    iterm:/dev/ttys[0-9]*|terminal:/dev/ttys[0-9]*|wezterm:/dev/ttys[0-9]*)
       _PLAIN_EMULATOR="${id%%:*}"
       _PLAIN_TTY="${id#*:}"
       case "${_PLAIN_TTY#/dev/ttys}" in ''|*[!0-9]*) return 1 ;; esac
+      return 0 ;;
+    # WezTerm also runs on Linux/WSL, where the tty is /dev/pts/N. The ref only
+    # records the spawn; with no measured adapter, peek/poke/despawn still refuse.
+    wezterm:/dev/pts/[0-9]*)
+      _PLAIN_EMULATOR=wezterm
+      _PLAIN_TTY="${id#*:}"
+      case "${_PLAIN_TTY#/dev/pts/}" in ''|*[!0-9]*) return 1 ;; esac
       return 0 ;;
     *) return 1 ;;
   esac
@@ -270,7 +277,7 @@ _plain_process_witness_matches() {   # <pid> <start> <tty> <kind>
     printf 'plain: %s process no longer controls %s\n' "$kind" "$tty" >&2
     return 10
   }
-  current_start="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//' | tr ' ' '_')"
+  current_start="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//' | tr ' ' '_')"
   [ -n "$current_start" ] && [ "$current_start" = "$start" ] || {
     printf 'plain: %s process witness no longer matches pid %s\n' "$kind" "$pid" >&2
     return 10
@@ -438,7 +445,7 @@ terminal_fence() {   # <id> [<seat-pid>]
   case "$observed" in ''|'??'|'-'|'?') printf '%s\tunknown:tty_unobservable\n' "$emulator"; return 2 ;; esac
   case "$observed" in /dev/*) ;; *) observed="/dev/$observed" ;; esac
   [ "$observed" = "$tty" ] || { printf '%s\tunknown:tty_mismatch:%s\n' "$emulator" "$observed"; return 2; }
-  start="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//' | tr ' ' '_')"
+  start="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//' | tr ' ' '_')"
   [ -n "$start" ] || { printf '%s\tunknown:tty_unobservable\n' "$emulator"; return 2; }
   printf '%s\ttty=%s,pid=%s,start=%s\n' "$emulator" "$tty" "$pid" "$start"
   return 0

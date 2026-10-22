@@ -1590,6 +1590,34 @@ T
   grep -Fq $'\tfence=iterm:tty=/dev/ttys040,boot=123,boot_start=Sat_Sep_13_02:10:11_2026' "$rec"
 }
 
+@test "spawn: a WezTerm window's own boot witness (Linux pts) is recorded, not refused" {
+  # Run the REAL boot through the template so its witness writer runs, instead
+  # of record.sh's canned iterm row. WSL WezTerm panes carry TERM_PROGRAM=WezTerm
+  # and a /dev/pts tty (measured 2026-10-22); before the fix the writer said
+  # 'unknown' and every Linux {cmd} spawn died with 'unsupported emulator or tty'.
+  printf '#!/usr/bin/env bash\nprintf "/dev/pts/20\\n"\n' > "$STUB_BIN/tty"
+  # A ja_JP machine localizes `ps -o lstart=` ("木 10月 22 ..."), which the
+  # witness validator rejects as an invalid start time (measured 2026-10-22).
+  # The stub answers in Japanese unless the caller pins LC_ALL=C.
+  local real_ps; real_ps="$(command -v ps)"
+  cat > "$STUB_BIN/ps" <<EOF
+#!/usr/bin/env bash
+case "\$*" in
+  *lstart=*) if [ "\${LC_ALL:-}" = C ]; then echo 'Thu Oct 22 16:56:10 2026'; else echo '木 10月 22 16:56:10 2026'; fi ;;
+  *) exec "$real_ps" "\$@" ;;
+esac
+EOF
+  chmod +x "$STUB_BIN/tty" "$STUB_BIN/ps"
+  unset AGMSG_TEST_PLAIN_WITNESS_ROW
+  export AGMSG_TERMINAL="{cmd}"
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run env TERM_PROGRAM=WezTerm LANG=ja_JP.UTF-8 bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
+  [ "$status" -eq 0 ]
+  local rec="$(_spawn_record_path myteam alice)"
+  grep -Fq $'plain:wezterm:/dev/pts/20\t' "$rec"
+  grep -Fq ',boot_start=Thu_Oct_22_16:56:10_2026' "$rec"
+}
+
 # --- codex launches through the bundled shim, by path (spawn_wrapper=) ---------
 # A person's shell reaches codex-shim.sh as a function or a PATH entry; the
 # non-interactive shell that runs a boot script has neither, so a bare `codex`

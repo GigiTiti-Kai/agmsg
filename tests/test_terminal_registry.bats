@@ -717,6 +717,60 @@ EOF
   refute terminal_id_ok 'terminal:/dev/ttysx'
 }
 
+@test "plain: address grammar accepts a WezTerm tty on Linux pts and macOS ttys" {
+  agmsg_terminal_load plain
+  terminal_id_ok 'wezterm:/dev/pts/20'
+  terminal_id_ok 'wezterm:/dev/ttys040'
+  refute terminal_id_ok 'wezterm:/dev/pts/'
+  refute terminal_id_ok 'wezterm:/dev/pts/2x'
+  refute terminal_id_ok 'unknown:/dev/pts/20'
+  # iTerm and Terminal.app only exist on macOS, so a pts ref for them is malformed
+  refute terminal_id_ok 'iterm:/dev/pts/20'
+  run terminal_id_split 'wezterm:/dev/pts/20'
+  [ "$status" -eq 0 ]
+  [ "$output" = $'wezterm\t/dev/pts/20' ]
+}
+
+@test "plain: a WezTerm window's witness becomes its locator, but addressed ops stay unsupported" {
+  cat > "$FAKEBIN/uname" <<'SH'
+#!/usr/bin/env bash
+printf 'Linux\n'
+SH
+  chmod +x "$FAKEBIN/uname"
+  export PATH="$FAKEBIN:$PATH"
+  agmsg_terminal_load plain
+  local boot="$TEST_SKILL_DIR/wezterm-boot"
+  printf '#!/usr/bin/env bash\nprintf '\''wezterm\\t/dev/pts/20\\t123\\tSTART\\n'\'' > "$AGMSG_PLAIN_SPAWN_WITNESS"\n' > "$boot"
+  chmod +x "$boot"
+  export AGMSG_TERMINAL="{cmd}"
+  export AGMSG_PLAIN_SPAWN_WITNESS="$TEST_SKILL_DIR/plain-witness"
+  run terminal_spawn alice /proj window "$boot"
+  [ "$status" -eq 0 ]
+  [ "$output" = "wezterm:/dev/pts/20" ]
+  # No measured WezTerm adapter exists, so peek/poke/despawn must refuse loudly
+  run terminal_capability peek 'wezterm:/dev/pts/20'
+  [ "$status" -eq 1 ]
+  printf '%s\n' "$output" | grep -Fq 'unsupported'
+}
+
+@test "plain: fence reads the start time in the C locale, matching the boot witness" {
+  # The boot witness pins LC_ALL=C; a fence read in ja_JP would say "木 10月 ..."
+  # and never match it.
+  cat > "$FAKEBIN/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *tty=*) printf 'pts/20\n' ;;
+  *lstart=*) if [ "${LC_ALL:-}" = C ]; then echo 'Thu Oct 22 16:56:10 2026'; else echo '木 10月 22 16:56:10 2026'; fi ;;
+esac
+SH
+  chmod +x "$FAKEBIN/ps"
+  export PATH="$FAKEBIN:$PATH" LANG=ja_JP.UTF-8
+  agmsg_terminal_load plain
+  run terminal_fence 'wezterm:/dev/pts/20' 123
+  [ "$status" -eq 0 ]
+  [ "$output" = $'wezterm\ttty=/dev/pts/20,pid=123,start=Thu_Oct_22_16:56:10_2026' ]
+}
+
 @test "plain: measured adapter support is checked again by peek and poke" {
   cat > "$FAKEBIN/uname" <<'SH'
 #!/usr/bin/env bash
