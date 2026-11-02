@@ -1,0 +1,47 @@
+name: fork bats
+
+# Fork-only workflow (GigiTiti-Kai/agmsg). Not part of upstream.
+#
+# The upstream `tests` workflow is disabled on this fork: one run is 26 jobs and
+# about 158 job-minutes (7 on macOS), and after 12 such runs in September 2026
+# GitHub stopped running workflows on the fork "due to the scale of GitHub
+# Actions usage" (found 2026-11-02). This runs only the bats files that touch
+# the plain terminal driver, which is where the fork's own patch lives, on one
+# Ubuntu runner. The file list is the same grep the dotfiles agmsg runbook uses.
+on:
+  push:
+    branches: [main, 'integration/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-bats-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bats:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure sqlite3 is available
+        run: sqlite3 --version >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y sqlite3; }
+
+      - name: Install bats
+        run: |
+          npm config set prefix "$HOME/.npm-global"
+          npm install -g bats@1.13.0
+          echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+
+      - name: Run the plain-driver bats files
+        run: |
+          files="$(grep -l -E '_plain_parse_id|PLAIN_WITNESS|terminal_detect|_agmsg_emulator|plain/ops.sh' tests/*.bats)"
+          test -n "$files"
+          printf '%s\n' "$files"
+          # shellcheck disable=SC2086 # one word per file name, none has spaces
+          bats $files
