@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
+import http from "node:http";
+import https from "node:https";
+import { Readable } from "node:stream";
 import { existsSync, readdirSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink,
   utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import test from "node:test";
+import test, { before, after } from "node:test";
 import { fileURLToPath } from "node:url";
 import { readNativeAgeIdentity } from "../scripts/internal/sync-cipher.mjs";
 import {
@@ -24,6 +27,9 @@ import {
   discardInputDirectory,
   driver,
   STORAGE_BUSY_EXIT,
+  restartAfterStandDown,
+  standDownRestartArgs,
+  stdinRedirect,
   storageDriverExitGraceMs,
   exportAgeHandoff,
   exportAgeSnapshot,
@@ -64,6 +70,39 @@ import {
   verifyAgeSnapshot,
   verifyAgeHandoff,
 } from "../scripts/internal/remote-sync.mjs";
+
+// Preserve the existing response fixtures while exercising the raw request
+// adapter. No request in this file may connect to an unstubbed remote host.
+let responseStub;
+const originalHttpRequest = http.request;
+const originalHttpsRequest = https.request;
+function fixtureRequest(url, options, onResponse) {
+  const request = new EventEmitter();
+  request.destroy = () => { request.destroyed = true; };
+  request.end = (body) => {
+    Promise.resolve().then(async () => {
+      if (!responseStub) throw new Error("unexpected HTTP request without a response fixture");
+      const response = await responseStub(url, { ...options, body });
+      if (request.destroyed) return;
+      const incoming = new Readable({ read() {} });
+      incoming.statusCode = response.status;
+      incoming.headers = {};
+      for (const name of ["content-encoding", "agmsg-protocol-version", "content-type"]) {
+        const value = response.headers.get(name);
+        if (value !== null && value !== undefined) incoming.headers[name] = value;
+      }
+      onResponse(incoming);
+      if (incoming.destroyed) return;
+      try {
+        incoming.push(Buffer.from(await response.text()));
+        incoming.push(null);
+      } catch (error) { incoming.destroy(error); }
+    }).catch((error) => request.emit("error", error));
+  };
+  return request;
+}
+before(() => { http.request = fixtureRequest; https.request = fixtureRequest; });
+after(() => { http.request = originalHttpRequest; https.request = originalHttpsRequest; });
 
 const config = {
   local_team: "demo",
@@ -1800,27 +1839,27 @@ test("run retry classification excludes permanent HTTP and validation failures",
 });
 
 test("headerless non-JSON intermediary failures remain retryable", async () => {
-  const previousFetch = globalThis.fetch;
+  const previousResponseStub = responseStub;
   try {
     await withConnectedCredential(async () => {
       for (const status of [502, 503, 504]) {
-        globalThis.fetch = async () => new Response("temporary proxy failure", { status });
+        responseStub = async () => new Response("temporary proxy failure", { status });
         await assert.rejects(request({ ...config, credential_id: credentialId,
           server_url: "https://sync.example" }, "/v1/messages"),
         (error) => error.status === status && error.retryable === true);
       }
     });
   } finally {
-    globalThis.fetch = previousFetch;
+    responseStub = previousResponseStub;
   }
 });
 
 test("request callers cannot override the binding headers, and it sends no Authorization", async () => {
-  const previousFetch = globalThis.fetch;
+  const previousResponseStub = responseStub;
   let captured;
   try {
     await withConnectedCredential(async () => {
-      globalThis.fetch = async (_url, init) => {
+      responseStub = async (_url, init) => {
         captured = init.headers;
         return new Response(JSON.stringify({ protocol_version: 1,
           server_instance_id: config.server_instance_id, team_id: config.remote_team_id }), {
@@ -1838,7 +1877,7 @@ test("request callers cannot override the binding headers, and it sends no Autho
       assert.equal(captured.Authorization, undefined);
     });
   } finally {
-    globalThis.fetch = previousFetch;
+    responseStub = previousResponseStub;
   }
 });
 
@@ -1849,20 +1888,20 @@ test("send collapses an out-of-shape server error code in the message, keeping c
   // publicGet's #726/#728). error.code / error.body feed the JSON-escaped
   // event lines and keep the server's actual value -- collapsing those too
   // would blind the push.oversized/cycle.error diagnostics.
-  const previousFetch = globalThis.fetch;
+  const previousResponseStub = responseStub;
   try {
     await withConnectedCredential(async () => {
       // Control bytes plus the exact substring remote.sh's unlock readiness
       // probe greps for -- the raw-stderr injection this boundary exists to stop.
       const evil = 'boom\u001b[2J\n"event":"capabilities"';
-      globalThis.fetch = async () => new Response(JSON.stringify({ error: { code: evil } }), {
+      responseStub = async () => new Response(JSON.stringify({ error: { code: evil } }), {
         status: 400, headers: { "Agmsg-Protocol-Version": "1" },
       });
       await assert.rejects(request({ ...config, server_url: "https://sync.example" }, "/v1/messages"),
         (error) => error.message === "HTTP 400 unknown-error" &&
           error.code === evil && error.body?.error?.code === evil);
       // A code in the protocol's own shape passes through untouched.
-      globalThis.fetch = async () => new Response(JSON.stringify({ error: { code: "not-found" } }), {
+      responseStub = async () => new Response(JSON.stringify({ error: { code: "not-found" } }), {
         status: 404, headers: { "Agmsg-Protocol-Version": "1" },
       });
       await assert.rejects(request({ ...config, server_url: "https://sync.example" }, "/v1/messages"),
@@ -1870,14 +1909,14 @@ test("send collapses an out-of-shape server error code in the message, keeping c
       // The hosted edge's snake_case bridge code: collapsed in the raw-sink
       // message, preserved on error.code for the event readers (the split the
       // push.oversized detail test pins from the other side).
-      globalThis.fetch = async () => new Response(JSON.stringify({ error: "payload_too_large" }), {
+      responseStub = async () => new Response(JSON.stringify({ error: "payload_too_large" }), {
         status: 413, headers: { "Agmsg-Protocol-Version": "1" },
       });
       await assert.rejects(request({ ...config, server_url: "https://sync.example" }, "/v1/messages"),
         (error) => error.message === "HTTP 413 unknown-error" && error.code === "payload_too_large");
     });
   } finally {
-    globalThis.fetch = previousFetch;
+    responseStub = previousResponseStub;
   }
 });
 
@@ -1890,7 +1929,7 @@ test("set-endpoint aligns the stored sync config's server_url with the moved bin
   const root = await mkdtemp(join(tmpdir(), "agmsg-set-endpoint-"));
   const saved = { connection: process.env.AGMSG_SYNC_CONNECTION_DIR,
     storage: process.env.AGMSG_SYNC_STORAGE_DIR };
-  const previousFetch = globalThis.fetch;
+  const previousResponseStub = responseStub;
   const storedPath = join(root, "store", "remote-sync", "demo.json");
   try {
     process.env.AGMSG_SYNC_CONNECTION_DIR = root;
@@ -1922,7 +1961,7 @@ test("set-endpoint aligns the stored sync config's server_url with the moved bin
         effective_from_seq: "1", accepted_envelope_versions: [1],
         write_allowed_ciphers: ["none"] }] };
     let fetchedUrl = null;
-    globalThis.fetch = async (url) => {
+    responseStub = async (url) => {
       fetchedUrl = String(url);
       return new Response(JSON.stringify(capabilities), { status: 200,
         headers: { "Agmsg-Protocol-Version": "1" } });
@@ -1948,7 +1987,7 @@ test("set-endpoint aligns the stored sync config's server_url with the moved bin
     await setEndpoint({ team: "demo" });
     await assert.rejects(readFile(storedPath, "utf8"), /ENOENT/u);
   } finally {
-    globalThis.fetch = previousFetch;
+    responseStub = previousResponseStub;
     if (saved.connection === undefined) delete process.env.AGMSG_SYNC_CONNECTION_DIR;
     else process.env.AGMSG_SYNC_CONNECTION_DIR = saved.connection;
     if (saved.storage === undefined) delete process.env.AGMSG_SYNC_STORAGE_DIR;
@@ -1966,7 +2005,7 @@ test("set-endpoint cannot land a stale alignment over a newer move (#739 interle
   const root = await mkdtemp(join(tmpdir(), "agmsg-set-endpoint-race-"));
   const saved = { connection: process.env.AGMSG_SYNC_CONNECTION_DIR,
     storage: process.env.AGMSG_SYNC_STORAGE_DIR };
-  const previousFetch = globalThis.fetch;
+  const previousResponseStub = responseStub;
   const storedPath = join(root, "store", "remote-sync", "demo.json");
   const teamCfgPath = join(root, "teams", "demo", "config.json");
   const bindingFor = (endpoint, revision) => ({ name: "demo", remote_binding: {
@@ -2001,7 +2040,7 @@ test("set-endpoint cannot land a stale alignment over a newer move (#739 interle
     const respond = () => new Response(JSON.stringify(capabilities), { status: 200,
       headers: { "Agmsg-Protocol-Version": "1" } });
     let releaseFetch = null;
-    globalThis.fetch = () => new Promise((resolveFetch) => {
+    responseStub = () => new Promise((resolveFetch) => {
       releaseFetch = () => resolveFetch(respond());
     });
     const stale = setEndpoint({ team: "demo" }); // A: verifying the move to X
@@ -2018,10 +2057,10 @@ test("set-endpoint cannot land a stale alignment over a newer move (#739 interle
     assert.equal(JSON.parse(await readFile(storedPath, "utf8")).server_url, "https://y.example");
     // And the lock was released on the refusal path: a fresh run against the
     // current binding completes (stored already matches -> recorded no-op).
-    globalThis.fetch = async () => respond();
+    responseStub = async () => respond();
     await setEndpoint({ team: "demo" });
   } finally {
-    globalThis.fetch = previousFetch;
+    responseStub = previousResponseStub;
     if (saved.connection === undefined) delete process.env.AGMSG_SYNC_CONNECTION_DIR;
     else process.env.AGMSG_SYNC_CONNECTION_DIR = saved.connection;
     if (saved.storage === undefined) delete process.env.AGMSG_SYNC_STORAGE_DIR;
@@ -2031,19 +2070,19 @@ test("set-endpoint cannot land a stale alignment over a newer move (#739 interle
 });
 
 test("request distinguishes config errors from response transport loss", async () => {
-  const previousFetch = globalThis.fetch;
+  const previousResponseStub = responseStub;
   let fetchCalled = false;
   try {
     await withConnectedCredential(async () => {
-      globalThis.fetch = async () => { fetchCalled = true; throw new Error("unexpected fetch"); };
+      responseStub = async () => { fetchCalled = true; throw new Error("unexpected fetch"); };
       await assert.rejects(request({ ...config, credential_id: credentialId,
         server_url: "not a URL" }, "/v1/messages"),
       (error) => error.retryable !== true);
       assert.equal(fetchCalled, false);
 
-      globalThis.fetch = async () => ({
+      responseStub = async () => ({
         ok: true, status: 200,
-        headers: { get: () => "1" },
+        headers: { get: (name) => name === "agmsg-protocol-version" ? "1" : null },
         text: async () => { throw new Error("body stream reset"); },
       });
       await assert.rejects(request({ ...config, credential_id: credentialId,
@@ -2051,7 +2090,7 @@ test("request distinguishes config errors from response transport loss", async (
       (error) => error.retryable === true);
     });
   } finally {
-    globalThis.fetch = previousFetch;
+    responseStub = previousResponseStub;
   }
 });
 
@@ -2278,6 +2317,7 @@ test("SIGTERM while this process holds the team config lock releases it before e
     }
     assert.ok(existsSync(lockDir), "child never took the team config lock");
     assert.ok(existsSync(holderPath), "child never wrote its holder");
+    assert.ok(existsSync(join(lockDir, ".owner")), "child never took the shared owner marker");
     child.kill("SIGTERM");
     await once(child, "exit");
     assert.ok(!existsSync(lockDir), "SIGTERM left the lock directory behind");
@@ -3048,7 +3088,7 @@ test("retained age checkpoint survives sync config reset and rejects same-revisi
 });
 
 test("age configure authenticates the connected credential before retaining trust", async () => {
-  const previousFetch = globalThis.fetch;
+  const previousResponseStub = responseStub;
   await withConnectedCredential(async (root) => {
     await writeConnectedTeam(root, { capabilities: { write_allowed_ciphers: ["age-v1"] } });
     const ageSnapshot = {
@@ -3077,7 +3117,7 @@ test("age configure authenticates the connected credential before retaining trus
     process.env.AGMSG_SYNC_TRUST_DIR = join(root, "trust");
     process.env.AGMSG_AGE_BIN = fakeAge;
     let calls = 0;
-    globalThis.fetch = async () => {
+    responseStub = async () => {
       calls += 1;
       if (calls === 1) {
         // The health reply has to name the team, or configure refuses here and
@@ -3104,7 +3144,7 @@ test("age configure authenticates the connected credential before retaining trus
       await assert.rejects(readdir(process.env.AGMSG_SYNC_TRUST_DIR),
         (error) => error.code === "ENOENT");
     } finally {
-      globalThis.fetch = previousFetch;
+      responseStub = previousResponseStub;
       if (saved.storage === undefined) delete process.env.AGMSG_SYNC_STORAGE_DIR;
       else process.env.AGMSG_SYNC_STORAGE_DIR = saved.storage;
       if (saved.trust === undefined) delete process.env.AGMSG_SYNC_TRUST_DIR;
@@ -3116,7 +3156,7 @@ test("age configure authenticates the connected credential before retaining trus
 });
 
 test("age configure extends a stored chain and activates its announced epoch", async () => {
-  const previousFetch = globalThis.fetch;
+  const previousResponseStub = responseStub;
   await withConnectedCredential(async (root) => {
     await writeConnectedTeam(root, { capabilities: { write_allowed_ciphers: ["age-v1"] } });
     const identityDir = join(root, "run", "remote-credentials", "demo", "keys");
@@ -3162,7 +3202,7 @@ test("age configure extends a stored chain and activates its announced epoch", a
     process.env.AGMSG_SYNC_STORAGE_DIR = join(root, "store");
     process.env.AGMSG_SYNC_TRUST_DIR = join(root, "trust");
     process.env.AGMSG_AGE_BIN = fakeAge;
-    globalThis.fetch = async (url) => {
+    responseStub = async (url) => {
       const body = String(url).endsWith("/v1/health") ?
         // team_id too: configure now reads it back and refuses a server that
         // names a different team, so a stub that omits it is a server which
@@ -3208,7 +3248,7 @@ test("age configure extends a stored chain and activates its announced epoch", a
       };
       assert.equal(selectWriteProfile(loaded, afterFirstSequence).key_id, "epoch-1");
     } finally {
-      globalThis.fetch = previousFetch;
+      responseStub = previousResponseStub;
       if (saved.storage === undefined) delete process.env.AGMSG_SYNC_STORAGE_DIR;
       else process.env.AGMSG_SYNC_STORAGE_DIR = saved.storage;
       if (saved.trust === undefined) delete process.env.AGMSG_SYNC_TRUST_DIR;
@@ -3226,10 +3266,10 @@ test("health treats a 503 error page as weather, not a protocol mismatch (#814)"
   // `health()` is what the engine's loop calls every cycle, so a 90-second
   // outage ended both engines on a live two-machine setup, permanently and
   // silently. The remote recovered; they did not.
-  const previousFetch = globalThis.fetch;
+  const previousResponseStub = responseStub;
   await withConnectedCredential(async (root) => {
     await writeConnectedTeam(root, { capabilities: { write_allowed_ciphers: ["none"] } });
-    globalThis.fetch = async () =>
+    responseStub = async () =>
       new Response("<html>503 Service Unavailable</html>",
         { status: 503, headers: { "Content-Type": "text/html" } });
     try {
@@ -3244,7 +3284,7 @@ test("health treats a 503 error page as weather, not a protocol mismatch (#814)"
           return true;
         });
     } finally {
-      globalThis.fetch = previousFetch;
+      responseStub = previousResponseStub;
     }
   });
 });
@@ -3254,10 +3294,10 @@ test("health still refuses a 200 that names a different protocol version (#814)"
   // "retry everything": a successful response whose header says another version
   // IS a real mismatch. Making the first case retryable must not make this one
   // retryable too — one condition covering both cases is what the defect was.
-  const previousFetch = globalThis.fetch;
+  const previousResponseStub = responseStub;
   await withConnectedCredential(async (root) => {
     await writeConnectedTeam(root, { capabilities: { write_allowed_ciphers: ["none"] } });
-    globalThis.fetch = async () =>
+    responseStub = async () =>
       new Response(JSON.stringify({ status: "ok", database: "ok",
         server_instance_id: config.server_instance_id,
         team_id: config.remote_team_id }),
@@ -3272,7 +3312,7 @@ test("health still refuses a 200 that names a different protocol version (#814)"
           return /protocol version mismatch/u.test(error.message);
         });
     } finally {
-      globalThis.fetch = previousFetch;
+      responseStub = previousResponseStub;
     }
   });
 });
@@ -3300,6 +3340,7 @@ test("configured native identity must belong to its epoch recipient manifest", a
 
 test("runLoop: an install update stands the engine down before any cycle, naming the update and the restart (#963)", async () => {
   const events = [];
+  const restarts = [];
   let cycles = 0;
   // Resolves -- a stand-down is a deliberate return, not a thrown failure.
   await runLoop(config, {}, {
@@ -3308,7 +3349,11 @@ test("runLoop: an install update stands the engine down before any cycle, naming
     cycleCall: async () => { cycles += 1; return {}; },
     sleepCall: async () => {},
     eventCall: async (name, fields) => { events.push({ name, ...fields }); },
+    restartCall: (team, root) => { restarts.push([team, root]); },
+    scriptsRoot: "/skill/scripts",
   });
+  // The stood-down engine asks for its own restart, from the updated scripts.
+  assert.deepEqual(restarts, [["demo", "/skill/scripts"]]);
   // Detected at the loop boundary: no driver was ever spawned.
   assert.equal(cycles, 0);
   assert.equal(events.length, 1);
@@ -4887,7 +4932,7 @@ test("driver() waits out a busy store and retries; anything else is asked once",
   };
   const counter = join(root, "calls");
   // A driver that is busy for its first `busyFor` calls and answers after that.
-  const useDriver = async (name, busyFor, exitWith = STORAGE_BUSY_EXIT) => {
+  const useDriver = async (name, busyFor, exitWith = STORAGE_BUSY_EXIT, message = "agmsg: sqlite-sync: prepare: the store is busy -- another writer held it") => {
     const script = join(root, name);
     await writeFile(script, [
       "#!/usr/bin/env bash",
@@ -4895,7 +4940,7 @@ test("driver() waits out a busy store and retries; anything else is asked once",
       `n=$(( $(cat ${shellQuote(counter)} 2>/dev/null || echo 0) + 1 ))`,
       `printf %s "$n" > ${shellQuote(counter)}`,
       `if [ "$n" -le ${busyFor} ]; then`,
-      "  echo 'agmsg: sqlite-sync: prepare: the store is busy -- another writer held it' >&2",
+      `  echo ${shellQuote(message)} >&2`,
       `  exit ${exitWith}`,
       "fi",
       "printf '%s\\n' '{\"type\":\"sync_state\",\"transport_cursor\":\"0\"}'",
@@ -4935,6 +4980,29 @@ test("driver() waits out a busy store and retries; anything else is asked once",
   assert.equal(await readFile(counter, "utf8"), "14");
   assert.equal(waits.reduce((sum, ms) => sum + ms, 0), 271000);
 
+  // A store that could not be opened for a moment (seen on Windows) is waited
+  // out like a busy one, so the engine does not die on it.
+  await useDriver("cannot-open.sh", 1, 13, "Error near line 50: unable to open database file");
+  waits.length = 0;
+  assert.deepEqual(await driver("read-prepare", config, [], [], dependencies), [{ type: "sync_state", transport_cursor: "0" }]);
+  assert.equal(await readFile(counter, "utf8"), "2");
+  assert.deepEqual(waits, [1000]);
+
+  // Another operation can fail after its COMMIT with the same words: a decision.
+  await useDriver("cannot-open-apply.sh", 1000, 13, "Error near line 50: unable to open database file");
+  waits.length = 0;
+  await assert.rejects(() => driver("apply", config, [], [], dependencies), (error) =>
+    error.driverExitCode === 13 && !isRetryable(error));
+  assert.equal(await readFile(counter, "utf8"), "1");
+
+  // The same words from a statement outside the transaction script (it can
+  // follow a COMMIT) are a decision: asked once.
+  await useDriver("open-after-commit.sh", 1000, 13, "Error: unable to open database file");
+  waits.length = 0;
+  await assert.rejects(() => driver("read-prepare", config, [], [], dependencies), (error) =>
+    error.driverExitCode === 13 && !isRetryable(error));
+  assert.equal(await readFile(counter, "utf8"), "1");
+
   // A failed check (13) is a decision: asked once, not retried, not retryable.
   await useDriver("refuses.sh", 1000, 13);
   waits.length = 0;
@@ -4942,4 +5010,116 @@ test("driver() waits out a busy store and retries; anything else is asked once",
     error.driverExitCode === 13 && !isRetryable(error) && error.code === undefined);
   assert.equal(await readFile(counter, "utf8"), "1");
   assert.deepEqual(waits, []);
+});
+
+test("every child the engine creates is spawned with windowsHide, or it fails with 0xC0000142 once the SSH session that started it is gone", async () => {
+  // The failure exists only on Windows after a disconnect, so CI on other
+  // platforms cannot observe it; guard the call sites themselves.
+  for (const [file, call] of [["remote-sync.mjs", "spawn(\"bash\", childArgs, {"], ["sync-cipher.mjs", "spawnSync(age, args, {"]]) {
+    const source = await readFile(new URL(`../scripts/internal/${file}`, import.meta.url), "utf8");
+    const at = source.indexOf(call);
+    assert.ok(at > 0, `${file}: spawn call not found`);
+    assert.match(source.slice(at, source.indexOf(");", at)), /windowsHide: true/, `${file}: spawn lacks windowsHide`);
+  }
+});
+
+test("a driver can read its staged input through the shell redirect used on Windows, where an inherited stdin file handle fails once the SSH session that started the engine is gone", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "agmsg-stdin-redirect-"));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  const input = join(root, "input.jsonl");
+  const driverScript = join(root, "driver.sh");
+  await writeFile(input, '{"type":"a"}\n{"type":"b"}\n');
+  await writeFile(driverScript, "#!/usr/bin/env bash\necho \"$1\"\ncat\n", { mode: 0o755 });
+  const { args, env } = stdinRedirect([driverScript, "prepare"], input);
+  const result = spawnSync("bash", args, { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, 'prepare\n{"type":"a"}\n{"type":"b"}\n');
+});
+
+test("restartAfterStandDown hands a detached helper the team and the updated remote.sh, without secrets, and survives a spawn error", () => {
+  const calls = [];
+  const listeners = {};
+  const fake = { unref() { calls.push("unref"); }, on(name, fn) { listeners[name] = fn; } };
+  restartAfterStandDown("demo", "/skill/scripts", {
+    spawnCall: (command, args, options) => { calls.push([command, args, options]); return fake; },
+    environment: { PATH: "/bin", AGMSG_SYNC_TOKEN: "secret", AGMSG_AGE_IDENTITY_FILE: "/id", AGMSG_SYNC_CONNECTION_DIR: "/conn" },
+  });
+  const [command, args, options] = calls[0];
+  assert.equal(command, "bash");
+  assert.deepEqual(args.slice(3, 5), [join("/skill/scripts", "remote.sh"), "demo"]);
+  assert.equal(options.detached, true);
+  assert.equal(options.stdio, "ignore");
+  assert.equal(options.windowsHide, true);
+  assert.deepEqual(options.env, { PATH: "/bin", AGMSG_SYNC_CONNECTION_DIR: "/conn" });
+  assert.equal(calls[1], "unref");
+  // An asynchronous spawn failure is reported, not raised.
+  assert.doesNotThrow(() => listeners.error(new Error("spawn bash ENOENT")));
+});
+
+test("the restart helper retries a failed start, never takes the predecessor's own 'already running' as success, and stops once another engine is up", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "agmsg-restart-helper-"));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  await mkdir(join(root, "run"));
+  await writeFile(join(root, "run", "remote-sync.demo.pid"), "111\n");
+  const remote = join(root, "remote.sh");
+  const log = join(root, "calls");
+  const counter = join(root, "n");
+  const useRemote = async (script) => {
+    await rm(counter, { force: true }); await rm(log, { force: true });
+    await writeFile(remote, [
+      "#!/usr/bin/env bash",
+      `n=$(( $(cat ${shellQuote(counter)} 2>/dev/null || echo 0) + 1 )); printf %s "$n" > ${shellQuote(counter)}`,
+      `printf '%s\\n' "$*" >> ${shellQuote(log)}`,
+      script, "",
+    ].join("\n"), { mode: 0o755 });
+  };
+  const run = () => spawnSync("bash", standDownRestartArgs("demo", root, [0, 0, 0, 0, 0]).map((a) => a === join(root, "remote.sh") ? remote : a),
+    { encoding: "utf8", env: { ...process.env, AGMSG_SYNC_CONNECTION_DIR: root } });
+  const calls = async () => (await readFile(log, "utf8")).trim().split("\n").length;
+
+  // A failed start, then the predecessor (pid 111) still reported twice, then started: three
+  // tries after the failure, and the predecessor's no-ops never count.
+  await useRemote('case "$n" in 1) echo "not yet" >&2; exit 1 ;; 2|3) echo "Sync engine already running (pid 111)."; exit 0 ;; *) echo "Sync engine started for demo (pid 2)."; exit 0 ;; esac');
+  let result = run();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await calls(), 4);
+
+  // Another engine (pid 222) already up: done at once.
+  await useRemote('echo "Sync engine already running (pid 222)."; exit 0');
+  result = run();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await calls(), 1);
+
+  // The predecessor never exits: the bounded attempts run out and the helper says it failed.
+  await useRemote('echo "Sync engine already running (pid 111)."; exit 0');
+  result = run();
+  assert.equal(result.status, 1);
+  assert.equal(await calls(), 5);
+});
+
+test("a roster state file the driver set aside is reported in the engine log, not in the result", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "agmsg-roster-reset-log-"));
+  const previous = { driver: process.env.AGMSG_SYNC_ROSTER_DRIVER, log: process.env.AGMSG_SYNC_LOG_FILE };
+  t.after(async () => {
+    for (const [name, value] of [["AGMSG_SYNC_ROSTER_DRIVER", previous.driver], ["AGMSG_SYNC_LOG_FILE", previous.log]]) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+    await rm(root, { recursive: true, force: true });
+  });
+  const script = join(root, "roster-driver.sh");
+  await writeFile(script, [
+    "#!/usr/bin/env bash",
+    "cat > /dev/null",
+    "echo 'agmsg: roster sync state /t/roster-sync.json was unreadable (bad); kept as /t/First Last/roster-sync.json.corrupt-1-2 and rebuilt from the server' >&2",
+    "echo '{\"type\":\"roster_sync_state\",\"transport_cursor\":\"0\"}'",
+    "",
+  ].join("\n"), { mode: 0o755 });
+  process.env.AGMSG_SYNC_ROSTER_DRIVER = script;
+  process.env.AGMSG_SYNC_LOG_FILE = join(root, "engine.log");
+  const records = await rosterDriver("prepare", config, [], []);
+  assert.deepEqual(records, [{ type: "roster_sync_state", transport_cursor: "0" }]);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const logged = (await readFile(process.env.AGMSG_SYNC_LOG_FILE, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(logged.map(({ event, team, file }) => [event, team, file]),
+    [["roster.state_reset", config.local_team, "/t/First Last/roster-sync.json.corrupt-1-2"]]);
 });

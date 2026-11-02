@@ -69,6 +69,10 @@
 #                                       or unknown:<reason>; environment only
 #   terminal_epoch                       optional, no args: generation value,
 #                                       n/a:<reason>, or unknown:<reason>
+#   terminal_expected_label <team> <agent> [id]
+#                                       Expected terminal agent name. The id
+#                                       lets a driver validate a retained name
+#                                       against this pane's placement metadata.
 #
 # Terminal identity is a driver FUNCTION (not a manifest datum like the types
 # axis's detect=) because a driver's environment contract is logic, not just a
@@ -443,7 +447,21 @@ agmsg_terminal_resolve_name() {
     if [ "$errf" != /dev/null ] && [ -f "$errf" ]; then
       reason="$(cat "$errf" 2>/dev/null || true)"
     fi
-    reasons="${reasons:+$reasons; }$name: ${reason:-present but could not identify this pane}"
+    reason="${reason:-present but could not identify this pane}"
+    # exclusive=1 (#1563 review): this candidate can never be NESTED under a
+    # later one the way herdr-in-tmux legitimately is, so "keep looking" is
+    # the wrong move here -- it is what let an inherited TMUX/TMUX_PANE from
+    # an unrelated earlier terminal session win the whole resolution instead
+    # of reporting the desktop session's own unresolved id (reproduced: a
+    # desktop session with no usable session id, and TMUX/TMUX_PANE leaked
+    # into its environment, resolved as a plain tmux pane). Fail loudly with
+    # ONLY this candidate's reason, immediately, rather than trying the rest.
+    if [ "$(agmsg_terminal_get "$name" exclusive 0)" = 1 ]; then
+      echo "agmsg: under $name but cannot identify this session to name it — $reason" >&2
+      [ "$errf" = /dev/null ] || rm -f "$errf"
+      return 1
+    fi
+    reasons="${reasons:+$reasons; }$name: $reason"
     saw_present_unnamed=1
   done
   [ "$errf" = /dev/null ] || rm -f "$errf"
@@ -459,6 +477,24 @@ agmsg_terminal_resolve_name() {
     printf '%s\t%s\n' "$plain_name" '-'
     return 0
   fi
+  return 1
+}
+
+# Is any exclusive=1 driver (terminal.conf — #1563) present in this
+# environment at all, regardless of whether it can resolve an id? Used by
+# agmsg_terminal_name_self to skip label-based pane lookup entirely once an
+# exclusive driver is present: that driver can never be a nested terminal
+# the way herdr-in-tmux legitimately is, so a stale team:agent label sitting
+# on some unrelated pane must never outrank it. Prints the driver's name, or
+# nothing (exit 1) when none is present.
+_agmsg_terminal_exclusive_present() {   # <session_id, may be empty>
+  local sid="${1:-}" name
+  for name in $(agmsg_terminal_candidates); do
+    [ "$(agmsg_terminal_get "$name" exclusive 0)" = 1 ] || continue
+    _agmsg_terminal_detect_one "$name" "$sid" >/dev/null 2>&1 || continue
+    printf '%s\n' "$name"
+    return 0
+  done
   return 1
 }
 
@@ -881,14 +917,18 @@ _agmsg_placement_split() {   # <ref>
   return 0
 }
 
-# <ref> <team> <agent>
+# <ref> <team> <agent> [all]
 #   Prints the claimant as its record file spells it ("<team>__<agent>", encoded)
 #   when ANOTHER seat's record claims this pane; prints nothing when the pane is
 #   unclaimed. Returns 1 when this seat's OWN ref cannot be parsed: ownership is
 #   then undecidable and the caller must not name or record (fail-closed).
+#
+#   With "all" it prints EVERY record that points at this pane, one per line, and
+#   skips a record whose ref cannot be read: "it cannot be ruled out as this
+#   pane" is a reason to refuse, and not a reason to take anything away.
 _agmsg_placement_claimed_by() {
-  local ref="$1" team="$2" agent="$3" dir f first mine enc_agent t is_mine
-  local want_term want_id want_sock
+  local ref="$1" team="$2" agent="$3" mode="${4:-first}" dir f first mine enc_agent t is_mine
+  local want_term want_id want_sock out=""
   _agmsg_placement_split "$ref" || return 1          # undecidable, not "unclaimed"
   want_term="$_AGMSG_PS_TERM"; want_id="$_AGMSG_PS_ID"; want_sock="$_AGMSG_PS_SOCK"
   mine="$(agmsg_spawn_path "$team" "$agent")" || return 1
@@ -920,6 +960,7 @@ _agmsg_placement_claimed_by() {
     # it lets a person drop it; waving it through is the fail-open this guard
     # exists to close.
     if [ -z "$first" ] || ! _agmsg_placement_split "$first"; then
+      if [ "$mode" = all ]; then continue; fi
       printf '%s' "${f##*/spawn.}"
       return 0
     fi
@@ -935,9 +976,108 @@ _agmsg_placement_claimed_by() {
        && [ "$_AGMSG_PS_SOCK" != "$want_sock" ]; then
       continue                                # different servers, different panes
     fi
+    if [ "$mode" = all ]; then
+      out="${out}${f##*/spawn.}"$'\n'
+      continue
+    fi
     printf '%s' "${f##*/spawn.}"
     return 0
   done
+  if [ "$mode" = all ]; then printf '%s' "$out"; fi
+  return 0
+}
+
+# The seat this session just stopped being. A session that acts as <agent> after
+# acting as another name in the SAME pane leaves the first name's record
+# pointing at the pane, and the placement guard then reads it as a rival: the new
+# name is neither named nor recorded, and warns on every action.
+#
+# Drops, of the records that point at THIS pane (the scan above, "all"), only
+# those that belong to a seat of THIS team and whose seat has no actas lock or
+# whose lock this very process holds, together with that seat's naming mark.
+#
+# THIS PROCESS, not this session id. A lock's owner is "<sid>.<pid>", and a
+# second process can carry the same sid (a resumed or forked session), so the
+# owner is compared whole against <instance>, the composite the claim itself
+# used; peeling the pid off made another live process's seat read as ours.
+# An owner, or an instance, that is only a bare sid cannot be shown not to be
+# another process's, so the record is kept.
+#
+# THIS TEAM, decided exactly: the candidates are the record paths of the team's
+# registered members, computed through agmsg_spawn_path -- never by cutting a
+# file name, because "__" is legal inside a name. A record of another team that
+# points at this pane is kept (and still refuses the new name, which is the
+# fail-closed side).
+#
+# Not touched either: a record for another pane, a seat another session holds, a
+# lock that cannot be read, and a record whose pane cannot be read. The new
+# name is only claimed once this has run, so every one of those keeps refusing
+# it exactly as before.
+#
+#   _agmsg_placement_retire_previous <ref> <team> <agent> <instance id>
+_agmsg_placement_retire_previous() {
+  local ref="$1" team="$2" agent="$3" instance="$4" suffixes s dir mine lock lockread owner role rt ra
+  local cfg esc m cand="" inteam
+  [ -n "$ref" ] && [ -n "$instance" ] || return 0
+  suffixes="$(_agmsg_placement_claimed_by "$ref" "$team" "$agent" all)" || return 0
+  [ -n "$suffixes" ] || return 0
+  mine="$(agmsg_spawn_path "$team" "$agent")" || return 0
+  dir="$(dirname "$mine")"
+  cfg="$(dirname "$dir")/teams/$team/config.json"
+  [ -f "$cfg" ] || return 0
+  esc="$(sed "s/'/''/g" "$cfg" 2>/dev/null)" || return 0
+  while IFS= read -r m; do
+    [ -n "$m" ] && [ "$m" != "$agent" ] || continue
+    cand="${cand}$(agmsg_spawn_path "$team" "$m" 2>/dev/null)"$'\n'
+  done <<EOF
+$(sqlite3 :memory: "SELECT key FROM json_each(json_extract('$esc', '\$.agents'));" 2>/dev/null | tr -d '\r')
+EOF
+  [ -n "$cand" ] || return 0
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    inteam=0
+    while IFS= read -r m; do
+      if [ -n "$m" ] && [ "$m" = "$dir/spawn.$s" ]; then inteam=1; break; fi
+    done <<EOF
+$cand
+EOF
+    [ "$inteam" -eq 1 ] || continue
+    lock="$dir/actas.$s.session"
+    lockread="$(_actas_lock_read_path "$lock")" || continue
+    case "${lockread%%$'\t'*}" in
+      absent) ;;
+      ok)
+        owner="${lockread#*$'\t'}"
+        [ "$owner" = "$instance" ] || continue
+        # A bare owner and a bare instance are equal and prove nothing: two
+        # processes with the same sid look identical. Only a composite pair
+        # says whose the lock is. (A missing check reads as "not composite".)
+        agmsg_instance_is_composite "$instance" 2>/dev/null || continue ;;
+      *) continue ;;
+    esac
+    # The naming mark lives in the seat's role-session record, which is keyed by
+    # NAME even where the spawn record is keyed by id, so it cannot be found from
+    # the spawn file's name. Found by what the record says it belongs to instead:
+    # the one whose team and agent resolve to this very spawn record.
+    if ! declare -F agmsg_role_session_clear_named_at >/dev/null 2>&1 \
+       && [ -n "${SKILL_DIR:-}" ] && [ -r "$SKILL_DIR/scripts/lib/role-session.sh" ]; then
+      # shellcheck disable=SC1090,SC1091
+      . "$SKILL_DIR/scripts/lib/role-session.sh" 2>/dev/null || true
+    fi
+    if declare -F agmsg_role_session_clear_named_at >/dev/null 2>&1; then
+      for role in "$dir"/role-session.*; do
+        [ -f "$role" ] || continue
+        rt="$(_agmsg_role_session_field "$role" team)"
+        ra="$(_agmsg_role_session_field "$role" agent)"
+        [ -n "$rt" ] && [ -n "$ra" ] || continue
+        [ "$(agmsg_spawn_path "$rt" "$ra" 2>/dev/null)" = "$dir/spawn.$s" ] || continue
+        agmsg_role_session_clear_named_at "$role" 2>/dev/null
+      done
+    fi
+    rm -f "$dir/spawn.$s"
+  done <<EOF
+$suffixes
+EOF
   return 0
 }
 
@@ -1029,6 +1169,13 @@ _agmsg_placement_claimant_here_now() {   # <rival-spawn-record-path> <claim-ref>
   declare -F _agmsg_role_session_field >/dev/null 2>&1 || { echo unknown; return 0; }
   claimant_sid="$(_agmsg_role_session_field "$role_path" session)"
   [ -n "$claimant_sid" ] || { echo unknown; return 0; }
+  # A Codex claimant's thread is not something herdr's agent list can answer
+  # for: its commands run under one shared app-server, and the list's
+  # agent_session for those panes is missing on most of them and, where present,
+  # names another seat's thread (measured: 1 of 5 Codex panes carried a session,
+  # and not the one running there). "Not among the live agents" would read a
+  # running Codex seat as gone and let another seat take its pane (#1112, #1468).
+  [ "$(_agmsg_role_session_field "$role_path" type)" != codex ] || { echo codex_unreadable; return 0; }
   declare -F terminal_session_live >/dev/null 2>&1 || { echo unknown; return 0; }
   live_out="$(terminal_session_live "$claimant_sid" 2>/dev/null)" || { echo unknown; return 0; }
   case "$live_out" in
@@ -1155,7 +1302,7 @@ EOF
 
 agmsg_terminal_name_self() {
   local sid="${1:-}" team="${2:-}" agent="${3:-}" project="${4:-}" type="${5:-}"
-  local write_record="${6:-}"
+  local write_record="${6:-}" retire="${7:-}" instance="${8:-}"
   [ -n "$team" ] && [ -n "$agent" ] || {
     echo "agmsg: terminal_name_self needs <team> and <agent>" >&2; return 1
   }
@@ -1188,10 +1335,20 @@ agmsg_terminal_name_self() {
   # substitution ends the CALLER before the status can be read -- the shape review
   # caught four times in this branch -- so every capture carries `|| rc=$?`.
   local resolved="" rc=0
+  # #1563 review: an exclusive=1 driver present in this environment (e.g.
+  # claude-desktop) skips the label lookup entirely -- it can never be a
+  # nested terminal the way herdr-in-tmux legitimately is, so a stale
+  # team:agent label written on some unrelated pane must not be allowed to
+  # outrank it (reproduced: a single old labelled pane elsewhere was picked
+  # over a live desktop session's own id).
+  local _excl=""
+  _excl="$(_agmsg_terminal_exclusive_present "$sid" 2>/dev/null)" || _excl=""
   # #1112: the label first, when it settles the question. Falls through silently
   # when it does not -- zero matches is the ordinary state before anything has
   # named this seat, and more than one means the label is not identifying here.
-  resolved="$(_agmsg_terminal_resolve_by_label "$team" "$agent" 2>/dev/null)" || resolved=""
+  if [ -z "$_excl" ]; then
+    resolved="$(_agmsg_terminal_resolve_by_label "$team" "$agent" 2>/dev/null)" || resolved=""
+  fi
   if [ -n "$resolved" ]; then
     :                                        # the label answered; skip the rest
   elif [ -n "$sid" ]; then
@@ -1220,9 +1377,25 @@ agmsg_terminal_name_self() {
   # Capability is DATA (terminal.conf), not a test on the driver's name: a
   # terminal that cannot name a pane is skipped without a word, and a terminal
   # that grows the ability later needs no change here.
-  local caps=""
+  #
+  # record_without_name=1 (#1563 review) is the one exception: a driver with
+  # no addressable pane to rename (claude-desktop) can still have its
+  # placement RECORDED, so team.sh reports it by name instead of
+  # unknown:no_placement_record. _no_rename skips only the terminal_name call
+  # below -- the placement guard and the record write that follow apply
+  # exactly as they do for any other driver.
+  local caps="" _no_rename=0
   caps="$(agmsg_terminal_get "$terminal" capabilities 2>/dev/null)" || caps=""
-  case " $caps " in *" name "*) ;; *) return 0 ;; esac
+  case " $caps " in
+    *" name "*) ;;
+    *)
+      if [ "$(agmsg_terminal_get "$terminal" record_without_name 0)" = 1 ]; then
+        _no_rename=1
+      else
+        return 0
+      fi
+      ;;
+  esac
 
   agmsg_terminal_load "$terminal" || return 1
 
@@ -1247,6 +1420,11 @@ agmsg_terminal_name_self() {
   if declare -F agmsg_spawn_path >/dev/null 2>&1; then
     local _claim_ref="" _claimed_by="" _claim_rc=0
     _claim_ref="$(agmsg_terminal_ref "$terminal" "$id" 2>/dev/null)" || _claim_ref=""
+    # An actas names a seat that may have been another name in this very pane a
+    # moment ago; only that caller passes the flag, and only after its claim won.
+    if [ "$retire" = retire_previous ]; then
+      _agmsg_placement_retire_previous "$_claim_ref" "$team" "$agent" "$instance" || true
+    fi
     # Undecidable (this seat's own ref cannot be parsed, or its record path
     # cannot be built) is not "unclaimed": neither name nor record then.
     _claimed_by="$(_agmsg_placement_claimed_by "$_claim_ref" "$team" "$agent")" || _claim_rc=$?
@@ -1264,16 +1442,51 @@ agmsg_terminal_name_self() {
       # with; a caller with none (every action-hook caller routed through
       # self-name.sh) cannot ask either question and keeps refusing exactly as
       # every caller did before this existed.
+      #
+      # VANISHED-TEAM RECORD: a claimant whose team is no longer on disk is an
+      # older placement. It is dropped, and the seat acting now takes the pane,
+      # unless its owner is confirmed to be alive in this very pane. This needs
+      # no session id; undecidable counts as not confirmed.
       local _took_over=0 _rival_spawn="" _role_path=""
       local _want_id=""
       _want_id="$(_agmsg_placement_bare_pane_id "$_claim_ref" 2>/dev/null)" || _want_id=""
-      if [ -n "$sid" ] && [ -n "$_want_id" ]; then
+      if true; then
         local _mine_spawn="" _claimant_here="unknown"
         _mine_spawn="$(agmsg_spawn_path "$team" "$agent" 2>/dev/null)" || _mine_spawn=""
         if [ -n "$_mine_spawn" ]; then
           _rival_spawn="$(dirname "$_mine_spawn")/spawn.$_claimed_by"
           _claimant_here="$(_agmsg_placement_claimant_here_now "$_rival_spawn" "$_claim_ref" 2>/dev/null)" || _claimant_here="unknown"
-          if [ "$_claimant_here" = not_here ] && declare -F terminal_session_live >/dev/null 2>&1; then
+          # A record whose team no longer exists on disk is an older placement,
+          # not a peer: unless its owner is confirmed to be in this very pane,
+          # the seat acting now takes the pane and the old record is dropped.
+          # Undecidable counts as not confirmed. Only a suffix that splits into
+          # exactly one team and one agent, by name, can be judged this way; an
+          # id-keyed record or an ambiguous suffix keeps the stricter rule below.
+          if [ "$_claimant_here" != here ]; then
+            local _cb_team="${_claimed_by%%__*}" _cb_rest="${_claimed_by#*__}" _cb_t _cb_exists=0
+            # No separator at all leaves both halves equal to the whole name.
+            case "$_claimed_by" in *__*) ;; *) _cb_rest="" ;; esac
+            # Only positive evidence counts: a teams directory that cannot be
+            # listed proves nothing about which teams exist.
+            ls -1 "$(dirname "$(dirname "$_mine_spawn")")/teams" >/dev/null 2>&1 || _cb_rest=""
+            case "$_cb_rest" in
+              *__*|"") ;;
+              *)
+                case "$_cb_team" in
+                  "") ;;
+                  ????????-????-????-????-????????????) ;;
+                  "$(_actas_lock_encode "$team")") ;;
+                  *)
+                    for _cb_t in "$(dirname "$(dirname "$_mine_spawn")")"/teams/*/; do
+                      [ -d "$_cb_t" ] || continue
+                      _cb_t="${_cb_t%/}"; _cb_t="${_cb_t##*/}"
+                      [ "$(_actas_lock_encode "$_cb_t")" = "$_cb_team" ] && { _cb_exists=1; break; }
+                    done
+                    [ "$_cb_exists" -eq 0 ] && _took_over=1 ;;
+                esac ;;
+            esac
+          fi
+          if [ "$_took_over" -eq 0 ] && [ -n "$sid" ] && [ -n "$_want_id" ] && [ "$_claimant_here" = not_here ] && declare -F terminal_session_live >/dev/null 2>&1; then
             local _mine_live="" _tab
             _tab="$(printf '\t')"
             _mine_live="$(terminal_session_live "$sid" 2>/dev/null)" || _mine_live=""
@@ -1281,6 +1494,23 @@ agmsg_terminal_name_self() {
               "live${_tab}"*)
                 [ "${_mine_live#"live${_tab}"}" = "$_want_id" ] && _took_over=1 ;;
             esac
+          fi
+        fi
+      fi
+      # The decision above took a while (a liveness query). The same path is
+      # not the same record: re-read it now, and only drop what still claims
+      # this pane and whose owner is still not shown to be here. A record that
+      # changed meanwhile is refused like any other claim.
+      if [ "$_took_over" -eq 1 ]; then
+        local _recheck="" _recheck_rc=0
+        # The slow question first, the record re-read last: nothing slow sits
+        # between the re-read and the removal.
+        if [ "$(_agmsg_placement_claimant_here_now "$_rival_spawn" "$_claim_ref" 2>/dev/null)" = here ]; then
+          _took_over=0
+        else
+          _recheck="$(_agmsg_placement_claimed_by "$_claim_ref" "$team" "$agent")" || _recheck_rc=$?
+          if [ "$_recheck_rc" -ne 0 ] || [ "$_recheck" != "$_claimed_by" ]; then
+            _took_over=0
           fi
         fi
       fi
@@ -1301,6 +1531,9 @@ agmsg_terminal_name_self() {
         fi
         declare -F agmsg_role_session_clear_named_at >/dev/null 2>&1 \
           && agmsg_role_session_clear_named_at "$_role_path" 2>/dev/null
+        # The old record goes, so it does not warn again on the next action.
+        rm -f "$_rival_spawn"
+        echo "agmsg: dropped the older placement record $_claimed_by, which pointed at this seat's pane." >&2
         # Fall through: this pane is this seat's to name/mark/record now.
       else
         # A claimant whose name ends in THIS seat's name may be this seat under a
@@ -1311,7 +1544,10 @@ agmsg_terminal_name_self() {
           *"__$(_actas_lock_encode "$agent")")
             _self_hint=" If '$_claimed_by' is this seat under a team that no longer exists, remove run/spawn.$_claimed_by." ;;
         esac
-        echo "agmsg: did not name or record this pane: this seat resolved $_claim_ref, and that pane is already recorded as $_claimed_by's. Keeping that seat's name and record. If that seat is gone, drop or despawn it and act again.$_self_hint (#1114 placement guard, kept alongside #1112's label-first resolution.)" >&2
+        if [ "${_claimant_here:-}" = codex_unreadable ]; then
+          _self_hint="$_self_hint That seat is a Codex seat, and whether it is still running cannot be read from the terminal (its commands run under a shared app-server), so the record was not treated as stale."
+        fi
+        echo "agmsg: did not name or record this pane: this seat resolved $_claim_ref, and that pane is already recorded as $_claimed_by's. Keeping that seat's name and record. To keep this seat instead, drop or despawn that seat (or remove run/spawn.$_claimed_by) and act again.$_self_hint (#1114 placement guard, kept alongside #1112's label-first resolution.)" >&2
         return 0
       fi
     fi
@@ -1323,9 +1559,10 @@ agmsg_terminal_name_self() {
   #
   # Narrower than an earlier revision of this comment claimed, and the difference
   # matters: `peek`, `poke` and `despawn` in THIS repo resolve through the
-  # placement record's pane id, and `_herdr_internal_key` is read nowhere outside
-  # its own driver (counted). So dropping the key does not make a member
-  # unreachable to agmsg. Saying it did pointed at the wrong thing to protect.
+  # placement record's pane id. team status and fix also verify the terminal's
+  # expected name; herdr may retain a name chosen outside agmsg. Dropping its
+  # key does not make a member unreachable to agmsg. Saying it did pointed at
+  # the wrong thing to protect.
   # A caller that genuinely wants no terminal writes at all is describing the
   # `plain` terminal.
   #
@@ -1339,13 +1576,16 @@ agmsg_terminal_name_self() {
 
   local out=""
   rc=0
-  out="$(terminal_name "$id" "$team" "$agent" "$name_mode")" || rc=$?
-  if [ "$rc" -ne 0 ]; then
-    echo "agmsg: could not name this $terminal pane for $team:$agent${out:+ ($out)}" >&2
-    return "$rc"
+  if [ "$_no_rename" -ne 1 ]; then
+    out="$(terminal_name "$id" "$team" "$agent" "$name_mode")" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "agmsg: could not name this $terminal pane for $team:$agent${out:+ ($out)}" >&2
+      return "$rc"
+    fi
   fi
 
-  # Named. Leave the mark that says so -- "agmsg named pane <ref> of server
+  # Named (or, for a record_without_name=1 driver, resolved with nothing to
+  # rename). Leave the mark that says so -- "agmsg named pane <ref> of server
   # generation <epoch> for this seat" -- in the seat's role-session record, so
   # the next action reads one file instead of calling the terminal (see
   # agmsg_self_name_on_action). Every path that names writes the same mark

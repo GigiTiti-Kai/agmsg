@@ -206,8 +206,12 @@ agmsg_delivery_apply_default() {
   # startup/parse error, positive-control confirmed — the Hooks Review screen was
   # not directly reached (inferred harmless). So the gate is defense-in-depth on
   # top of that measurement, not the sole protection against an unknown.
+  # Only turn and both install the PostToolUse entry, so only they need the CLI's
+  # version. Asking for monitor/off ran `<cli> --version` for nothing, and for
+  # codex that call goes back through the PATH shim.
   local pt_output pt_min pt_cli pt_install=0
   pt_output=$(agmsg_type_get "$type" posttooluse_output 2>/dev/null || true)
+  case "$mode" in turn|both) ;; *) pt_output="" ;; esac
   if [ -n "$pt_output" ]; then
     pt_min=$(agmsg_type_get "$type" posttooluse_min_cli 2>/dev/null || true)
     pt_cli=$(agmsg_type_get "$type" cli 2>/dev/null || true)
@@ -216,6 +220,15 @@ agmsg_delivery_apply_default() {
     elif _agmsg_cli_version_ge "$pt_cli" "$pt_min"; then
       pt_install=1                              # CLI confirmed new enough
     fi
+  fi
+
+  # A hooks file whose event is not an array is left exactly as it is, and the
+  # error names that file rather than the temp copy below.
+  if [ -f "$hooks_file" ]; then
+    local chk_event
+    for chk_event in SessionStart SessionEnd Stop PostToolUse; do
+      _agmsg_hooks_event_is_array "$hooks_file" "$chk_event" || return 1
+    done
   fi
 
   # Work on a temp copy so a partially-modified file never replaces the
@@ -611,32 +624,15 @@ EOF
   # with spaces or apostrophes intact; a plain '...' wrap breaks on /o'brien/...
   # (#188).
   local watch_command
-  watch_command="$(printf '%q %q %q %q' "$watch" "$session_id" "$project" "$type")"
-  # AGMSG_CC_MONITOR_KEEP_ALIVE, default OFF: timeout_ms: 1800000 always
-  # stays (the Monitor tool caps every watch there regardless). What differs
-  # is whether re-arming on expiry is UNCONDITIONAL or read off the expiry
-  # notification itself. Claude Code counts the events on its own side and
-  # names that count in the notification -- agmsg never counts it -- so the
-  # default case below is worded as a plain word match on that notification
-  # ("no events" present or not), never as reading a number: the exact
-  # phrasing may drift, and a seat that has to parse a count is a seat this
-  # can break by rewording the notification later.
+  watch_command="$(printf '%q %q %q %q' "$watch" "$session_id" "$project" "$type") --max-seconds=1750"
+  # The watch renews itself (scripts/watch.sh, _watch_renew_or_stop): launched
+  # with --max-seconds it prints one "re-arm" or "stopping" line a
+  # little before Claude Code's 30-minute Monitor cap and exits.
+  # timeout_ms: 1800000 always stays; AGMSG_CC_MONITOR_KEEP_ALIVE is read by the
+  # watcher itself. Word-for-word identical to scripts/session-start.sh.
   local rearm_note
-  if [ -n "${AGMSG_CC_MONITOR_KEEP_ALIVE:-}" ]; then
-    rearm_note=" This watch expires after at most 30 minutes; when the expiry
-notice arrives, immediately re-arm it by invoking Monitor again with this
-exact command and description — delivery depends on it, since nothing else
-keeps the stream running. Re-arm it silently: no message to the user, no
-\"re-armed\", no acknowledgement, no summary — just invoke Monitor again and
-continue, since announcing it every 30 minutes wastes tokens for no benefit."
-  else
-    rearm_note=" This watch expires after at most 30 minutes.
-If the expiry notification says it delivered no events, do not re-arm it.
-Otherwise (it says it delivered something), re-arm it by invoking Monitor again with this exact command and description.
-Re-arm it silently, when you do: no message to the user, no \"re-armed\", no
-acknowledgement, no summary — just invoke Monitor again and continue, since
-announcing it every 30 minutes wastes tokens for no benefit."
-  fi
+  rearm_note="
+This watch renews itself. A little before the 30-minute cap it prints one line on its own and exits: on \`agmsg watch: re-arm - ...\`, invoke Monitor again with exactly the command and description that line names (persistent: true, timeout_ms: 1800000), silently — no message to the user, no \"re-armed\", no acknowledgement, no summary, since announcing it every 30 minutes wastes tokens for no benefit; on \`agmsg watch: stopping - ...\`, do not re-arm it. If the watch is instead killed at the cap and no such line arrived (an agmsg install from before this), re-arm it only when the expiry notification says it delivered something."
   cat <<EOF
 
 AGMSG-DIRECTIVE: For this running session, invoke the Monitor tool now with:
@@ -647,11 +643,10 @@ AGMSG-DIRECTIVE: For this running session, invoke the Monitor tool now with:
 
 Pass the command above verbatim — the session_id is already filled in.
 Use Claude Code's generic Monitor tool only. Do not start this command with
-Bash/background/nohup or a shell task. Success is a TaskList entry whose
-description begins with "agmsg inbox stream" (after actas it reads
-"agmsg inbox stream (acting as <name>)") and, once messages arrive, a
-transcript event named to match. The background-task footer is not a
-reliable check either way; use TaskList. If ToolSearch cannot find the
+Bash/background/nohup or a shell task. Success is the Monitor call starting
+(description "agmsg inbox stream", after actas "agmsg inbox stream (acting as
+<name>)") and, once messages arrive, a transcript event named to match.
+TaskList may list this task, but not every environment does (the desktop app's Code tab runs the Monitor and delivers its events without listing it), so a task missing from TaskList is not a failure: judge by the Monitor call starting and its events arriving. The background-task footer is not a reliable check either. If ToolSearch cannot find the
 generic Monitor tool, use turn/manual inbox as a fallback; that is not
 real-time monitor delivery.${rearm_note}
 EOF
@@ -660,10 +655,11 @@ EOF
 emit_stop_directive() {
   cat <<'EOF'
 
-AGMSG-DIRECTIVE: If an agmsg watch Monitor task is running in this session,
-find it with TaskList (description starts with "agmsg inbox stream") and
-stop it with TaskStop. Existing watch.sh processes have already been killed
-by this command.
+AGMSG-DIRECTIVE: If you know of an agmsg watch Monitor task running in this
+session (listed by TaskList with a description that starts with "agmsg inbox
+stream", or the task_id returned by your own Monitor call), stop it with
+TaskStop; do not guess a task_id. Existing watch.sh processes have already been
+killed by this command.
 EOF
 }
 
@@ -989,8 +985,7 @@ do_status() {
 note: status reports configured hooks only. For real-time delivery, Claude Code
 must also have a generic Monitor task running in the current session whose
 description begins with "agmsg inbox stream" (after actas: "agmsg inbox
-stream (acting as <name>)"). Verify with TaskList, not the background-task
-footer — the footer is not a reliable signal either way. A watch.sh started
+stream (acting as <name>)"). TaskList may list this task, but not every environment does (the desktop app's Code tab runs the Monitor and delivers its events without listing it), so a task missing from TaskList is not a failure: judge by the Monitor call starting and its events arriving. The background-task footer is not a reliable check either. A watch.sh started
 as a shell/background/nohup task instead of through the Monitor tool is not
 real-time delivery even while its process stays alive.
 EOF

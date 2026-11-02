@@ -87,7 +87,7 @@ _agmsg_pid_valid() {
   # DWORD, and the liveness path there queries the native process table via
   # tasklist rather than kill(1)'s signed pid_t — applying the POSIX bound to it
   # would call a legitimate native pid dead and its live watcher stale.
-  case "${MSYSTEM:-}" in MINGW*|MSYS*|CLANGARM*) max=4294967295 ;; esac
+  case "${MSYSTEM:-}" in MINGW*|MSYS*|UCRT*|CLANG*) max=4294967295 ;; esac
   # And it has to fit whichever of those the platform uses. The POSIX ceiling is
   # what makes the rest of this library safe: past INT32_MAX, kill(1) rejects the
   # ARGUMENT ("not a pid or valid job spec") rather than reporting ESRCH — and
@@ -104,6 +104,21 @@ _agmsg_pid_valid() {
   [ "${#pid}" -le 10 ] || return 1
   if [ "${#pid}" -eq 10 ] && [ "$pid" \> "$max" ]; then return 1; fi
   return 0
+}
+
+# Does the pid exist, by the signal alone? Kept here because this file owns
+# every kill -0. Unlike _agmsg_pid_alive it reports three states, for a caller
+# that cannot run ps (an app sandbox denies it). Answers "gone" only on a clear
+# "no such process". A sandbox may refuse the signal even for a live process
+# (not permitted), which says the process exists; anything else is "unknown".
+_agmsg_pid_signal_presence() {   # <pid>
+  local out
+  out="$(export LC_ALL=C; kill -0 "$1" 2>&1)" && { echo alive; return 0; }
+  case "$out" in
+    *"No such process"*) echo gone ;;
+    *"not permitted"*) echo alive ;;
+    *) echo unknown ;;
+  esac
 }
 
 # Liveness for a pid THIS codebase minted: $! or $$ in one of these shells, or
@@ -297,7 +312,7 @@ _agmsg_pid_alive() {
   local pid="$1"
   _agmsg_pid_valid "$pid" || return 1
   case "${MSYSTEM:-}" in
-    MINGW*|MSYS*|CLANGARM*)
+    MINGW*|MSYS*|UCRT*|CLANG*)
       MSYS_NO_PATHCONV=1 tasklist /FI "PID eq $pid" 2>/dev/null | grep -q "$pid"
       return $?
       ;;
