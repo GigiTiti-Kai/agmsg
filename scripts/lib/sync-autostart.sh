@@ -63,6 +63,10 @@ agmsg_sync_autostart() {
   fi
   [ -x "$remote_sh" ] || return 0
   [ $# -gt 0 ] || return 0
+  if ! declare -F _agmsg_dir_take >/dev/null 2>&1; then
+    # shellcheck source=registry-lock.sh
+    . "${BASH_SOURCE[0]%/*}/registry-lock.sh"
+  fi
 
   # Seconds, for the whole call. Overridable so a test can drive the deadline
   # without waiting for it, and so an operator on a slow machine can raise it.
@@ -152,26 +156,64 @@ agmsg_sync_autostart() {
       agmsg_close_inherited_fds
       "$remote_sh" sync start "$team" >"$tmp" 2>&1
       printf '%s\n' "$?" > "$tmp.rc"
+      # One noclobber owner marker decides which side reached cleanup first;
+      # mkdir alone can report a racing EEXIST as success on both sides.
+      # If the child loses, the caller has stopped waiting and delegates cleanup
+      # to this child. If the child wins, leave the results for the caller,
+      # unless its fast path has already read and removed them. In that case
+      # the child also removes the marker the caller may have missed.
+      if _agmsg_dir_take "$tmp.gaveup" 2>/dev/null; then
+        [ -f "$tmp.rc" ] || _agmsg_dir_drop "$tmp.gaveup" 2>/dev/null
+      else
+        rm -f "$tmp" "$tmp.rc"
+        _agmsg_dir_drop "$tmp.gaveup" 2>/dev/null
+      fi
+    ) </dev/null >/dev/null 2>&1 3>&- 4>&- &
     # The literal `3>&- 4>&-` as well as the call inside, because the repo-wide
     # check reads the spawn LINE (tests/test_spawn_fd_guard.bats). Belt and
     # braces is the right answer here anyway: the call closes whatever the
     # runtime handed down, and the redirections say so where a reader — and
     # that check — can see it without following a function.
-    ) </dev/null >/dev/null 2>&1 3>&- 4>&- &
     while [ ! -f "$tmp.rc" ] && [ $((SECONDS - elapsed_start)) -lt "$budget" ]; do
       sleep 0.1
     done
     if [ ! -f "$tmp.rc" ]; then
-      # Budget spent. The child is NOT killed — see the header — so its two
-      # temp files are left for it to finish writing into. They are in the
-      # system temp directory, and that is the price of not truncating a start
-      # that may be about to succeed.
-      slow="$slow$team"$'\n'
-      continue
+      # Budget spent, but NOT necessarily "the child has not finished" --
+      # the write ($tmp.rc) and this check are not atomic with each other,
+      # so the child may finish in the gap between them. The owner claim below is
+      # what actually answers "did the child already get here first", not
+      # this -f test (see the matching one in the child above):
+      if _agmsg_dir_take "$tmp.gaveup" 2>/dev/null; then
+        # Got there first. The child has not reached its own owner claim
+        # yet (has not finished, or has not reached that line even if it
+        # has), so it still owns removing $tmp/$tmp.rc once it does.
+        slow="$slow$team"$'\n'
+        continue
+      fi
+      # The child's owner claim got there first, which only happens once it has
+      # already written $tmp.rc -- so despite the budget, this reads
+      # exactly like the fast path below, just a little later.
     fi
     rc="$(cat "$tmp.rc" 2>/dev/null || printf '1')"
     out="$(cat "$tmp" 2>/dev/null)"
+    # Order matters here, and is NOT interchangeable with the rmdir right
+    # below: this rm must run FIRST. The child's own self-correction (see
+    # its ownership-succeeded branch above) only removes the marker when it
+    # finds $tmp.rc already gone -- if this rm ran AFTER that rmdir instead,
+    # a child that is still between its mkdir and that re-check would see
+    # the marker gone, assume this side already finished, and never clean
+    # up $tmp/$tmp.rc itself, leaking both.
     rm -f "$tmp" "$tmp.rc"
+    # Covers BOTH ways this line is reached: the budget-exceeded branch just
+    # above, where the child's owner claim winning is what sent this here instead
+    # of to `continue`, and the plain fast path (the while loop above exited
+    # because $tmp.rc already existed, never entering that branch at all) --
+    # on the fast path the child's own owner claim almost always wins (the caller
+    # never tried its own), leaving the marker owned by nobody once the
+    # child's "do nothing further" half of the protocol is reached; cleaned
+    # up here rather than left as a new kind of leaked empty directory. A
+    # no-op either way if the child got here first and already removed it.
+    _agmsg_dir_drop "$tmp.gaveup" 2>/dev/null
     if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'already running'; then
       continue
     fi

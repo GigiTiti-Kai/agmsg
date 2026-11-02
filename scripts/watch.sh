@@ -41,6 +41,21 @@ ORIG_ARGS=("$@")
 # libs are sourced) rather than failing hard, so a runtime that cannot bake one
 # in — notably Grok Build's `monitor` tool, where "$GROK_SESSION_ID" expands to
 # empty — still starts the watcher. project_path and agent_type are required.
+# `--max-seconds=N` (a trailing option agmsg's own Claude Code launch commands
+# add) turns on self-managed renewal; see _watch_renew_or_stop below. It is
+# taken out of the positional list here so the rest of the script is unchanged,
+# and it stays in ORIG_ARGS so a self-restart and the re-arm line replay it.
+WATCH_MAX_SECONDS=""
+_wargs=()
+for _a in "$@"; do
+  case "$_a" in
+    --max-seconds=*) WATCH_MAX_SECONDS="${_a#--max-seconds=}" ;;
+    *) _wargs+=("$_a") ;;
+  esac
+done
+set -- ${_wargs[@]+"${_wargs[@]}"}
+unset _wargs _a
+
 SESSION_ID="${1:-}"
 [ "$SESSION_ID" = "-" ] && SESSION_ID="" # #477: caller sentinel for empty session id
 PROJECT_PATH="${2:?Missing project_path}"
@@ -49,6 +64,8 @@ ACTIVE_NAME="${4:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Polling and its child operations must never run the user-operation notice.
+export AGMSG_DAEMON_NOTICE_SKIP=1
 source "$SCRIPT_DIR/lib/storage.sh"
 agmsg_storage_load
 # Warm agmsg_storage_dir's own process-lifetime cache as a PLAIN STATEMENT,
@@ -71,6 +88,14 @@ source "$SCRIPT_DIR/lib/resolve-project.sh"
 # reaching for $TMUX_PANE behind its own back.
 # shellcheck disable=SC1091
 [ -r "$SCRIPT_DIR/lib/terminal-registry.sh" ] && . "$SCRIPT_DIR/lib/terminal-registry.sh"
+# Same libs actas-claim.sh reads the native-delivery record through
+# (role-session.sh's messaging_socket field here, daemon-state.sh's
+# AGMSGD_HEALTH loaded lazily in _agmsg_watch_native_delivery_active below).
+# Guarded the same way: an install predating native delivery simply lacks
+# these files, and the re-arm loop falls back to its original
+# always-renew-or-stop-on-silence behavior.
+# shellcheck disable=SC1091
+[ -r "$SCRIPT_DIR/lib/role-session.sh" ] && . "$SCRIPT_DIR/lib/role-session.sh"
 
 # Resolve a session id when the launcher could not bake one in (empty first arg).
 # Grok Build's `monitor` tool runs the watcher with $GROK_SESSION_ID unset, so
@@ -863,7 +888,12 @@ _handle_install_changed() {
       cleanup
       AGMSG_WATCH_RESTART_COUNT=$((restarts + 1))
       AGMSG_WATCH_RESTART_CHAIN="$_WATCH_INSTALL_RESTART_CHAIN"
-      export AGMSG_WATCH_RESTART_COUNT AGMSG_WATCH_RESTART_CHAIN
+      # The renewal clock and delivery count (see _watch_renew_or_stop) belong
+      # to the whole run, not to this process image: without them an update
+      # mid-run would restart the clock past the host's own cap.
+      AGMSG_WATCH_ELAPSED_BASE=$((SECONDS + _WATCH_ELAPSED_BASE))
+      AGMSG_WATCH_DELIVERED_BASE="$_WATCH_DELIVERED"
+      export AGMSG_WATCH_RESTART_COUNT AGMSG_WATCH_RESTART_CHAIN AGMSG_WATCH_ELAPSED_BASE AGMSG_WATCH_DELIVERED_BASE
       # The watch_report call below is reached only if exec itself fails to
       # replace the process image (e.g. an interpreter it can no longer
       # exec); it is the fallback for that failure, not dead code.
@@ -1143,7 +1173,139 @@ _AGMSG_EXIT_TEARDOWN_INCOMPLETE=76
 STUCK_MAP=""
 source "$SCRIPT_DIR/lib/watch-stuck-map.sh"
 
+# Self-managed renewal, for hosts that cap how long a watch may run (Claude Code's
+# Monitor kills one at 30 minutes and leaves no completion record, which piles up
+# as "background shell command tasks did not finish" on every resume).
+# --max-seconds is added only by the launch commands agmsg writes for that host;
+# without it (every other caller) the watcher never ends on its own.
+# Shortly before the cap, at the top of a cycle (so nothing is mid-delivery and
+# the read cursor has already been consumed), the watcher decides for itself and
+# prints one line on stdout -- one notification per cycle:
+#   - it delivered something this run, or AGMSG_CC_MONITOR_KEEP_ALIVE is set:
+#     "agmsg watch: re-arm ..." naming the command and description to hand back
+#     to Monitor unchanged;
+#   - otherwise "agmsg watch: stopping ...": nothing to renew.
+# Then it exits 0. A restart resumes from the persistent read cursor, so the gap
+# before the host re-arms loses nothing.
+case "$WATCH_MAX_SECONDS" in ''|*[!0-9]*) WATCH_MAX_SECONDS="" ;; esac
+_WATCH_ELAPSED_BASE="${AGMSG_WATCH_ELAPSED_BASE:-0}"
+case "$_WATCH_ELAPSED_BASE" in ''|*[!0-9]*) _WATCH_ELAPSED_BASE=0 ;; esac
+_WATCH_DELIVERED="${AGMSG_WATCH_DELIVERED_BASE:-0}"
+case "$_WATCH_DELIVERED" in ''|*[!0-9]*) _WATCH_DELIVERED=0 ;; esac
+unset AGMSG_WATCH_ELAPSED_BASE AGMSG_WATCH_DELIVERED_BASE
+
+# True only once agmsgd has actually taken over delivery for every pair this
+# watcher serves -- the same two reads actas-claim.sh/daemon.sh status use to
+# decide and report native delivery (daemon-state.sh's AGMSGD_HEALTH, role-
+# session.sh's messaging_socket field), reused rather than re-derived so this
+# can never disagree with what `delivery=native`/`daemon.sh status` already
+# told the seat.
+#
+# Native delivery is only ever claimed for an exclusive (actas) role (see
+# actas-claim.sh's own TYPE=claude-code, NAME-scoped gate) -- a broad watcher
+# (no ACTIVE_NAME) never has a role-session record to check, and must keep
+# renewing exactly as before.
+#
+# "Recorded" means agmsg_role_session_uuid for THIS pair equals this session's
+# own bare sid (not merely that some session claimed native once) -- a stale
+# record from a since-exited session must not stop a watcher that is this
+# seat's only remaining delivery path. AGMSGD_HEALTH=ready is re-checked every
+# call (not cached) so a daemon that stops after actas claimed native
+# correctly falls back to normal re-arming instead of leaving the seat with
+# neither channel.
+#
+# Beyond the bare sid match, this mirrors every other gate
+# claude-code-queue.mjs's createPending itself applies to the SAME record
+# before it will ever enqueue a nudge for this pair (follow-up to #1633
+# review: checking messaging_socket alone proved the record existed, not that
+# the daemon would actually treat it as addressable):
+#   - type must read "claude-code" (role_session_type_mismatch)
+#   - claude_config_dir must be non-empty, same as messaging_socket
+#     (messaging_destination_missing)
+#   - project must canonically match this watcher's own project
+#     (role_session_project_mismatch) -- agmsg_canonical_path is the same
+#     normalization actas-claim.sh applies before writing PROJECT_PHYS, so
+#     comparing against it here can never disagree with what was recorded.
+# team/agent identity mismatch (the mjs reader's own first check,
+# role_session_identity_mismatch) DOES need its own comparison here (review
+# round 2): being looked up BY (team, agent) only proves the FILENAME
+# encodes this pair -- the daemon's reader separately checks the record's own
+# team=/agent= CONTENT fields, which a corrupted or hand-edited record can
+# disagree with the name it is filed under. The shell getters have no
+# built-in enforcement of that either, so it is compared explicitly, the
+# same as every other field above.
+#
+# AGMSGD_DESIRED must also be `on`, not just HEALTH=ready (review, #1633):
+# during `daemon disable`, the intent flips to off before the still-running
+# owner finishes shutting down, so HEALTH can read `ready` for a window after
+# DESIRED already reads `off`. The queue this seat would otherwise rely on
+# (claude-code-queue.mjs createPending) refuses to enqueue at all once
+# desired != on, so stopping on HEALTH alone during that window would leave
+# the seat with no delivery path whatsoever -- exactly the failure this whole
+# check exists to avoid, just reached from the other direction (disable
+# in-flight instead of a dead executor).
+_agmsg_watch_native_delivery_active() {
+  [ "$AGENT_TYPE" = claude-code ] && [ -n "$ACTIVE_NAME" ] || return 1
+  declare -F agmsg_role_session_uuid >/dev/null 2>&1 || return 1
+  # Loaded only here: a watcher and its children otherwise never pay for it.
+  # shellcheck disable=SC1091
+  declare -F agmsg_daemon_read_state >/dev/null 2>&1 \
+    || { [ -r "$SCRIPT_DIR/lib/daemon-state.sh" ] && . "$SCRIPT_DIR/lib/daemon-state.sh"; } \
+    || return 1
+  local AGMSGD_DESIRED AGMSGD_HEALTH AGMSGD_REASON
+  agmsg_daemon_read_state
+  agmsg_daemon_apply_project_choice claude-code "$PROJECT_PATH"
+  [ "${AGMSGD_DESIRED:-}" = on ] && [ "${AGMSGD_HEALTH:-}" = ready ] || return 1
+  declare -F _agmsg_detect_platform >/dev/null 2>&1 && _agmsg_detect_platform
+  declare -F agmsg_claude_code_native_storage_ready >/dev/null 2>&1 || return 1
+  agmsg_claude_code_native_storage_ready || return 1
+  local bare_sid="$SESSION_ID"
+  if declare -F agmsg_instance_bare_sid >/dev/null 2>&1; then
+    bare_sid="$(agmsg_instance_bare_sid "$SESSION_ID")"
+  fi
+  [ -n "$bare_sid" ] || return 1
+  local _canon_project
+  _canon_project="$(agmsg_canonical_path "$PROJECT_PATH")"
+  [ -n "$_canon_project" ] || return 1
+  local _team _agent _any=0
+  while IFS=$'\t' read -r _team _agent; do
+    [ -z "$_team" ] && continue
+    _any=1
+    [ "$(agmsg_role_session_uuid "$_team" "$_agent" 2>/dev/null)" = "$bare_sid" ] || return 1
+    [ "$(agmsg_role_session_get "$_team" "$_agent" team 2>/dev/null)" = "$_team" ] || return 1
+    [ "$(agmsg_role_session_get "$_team" "$_agent" agent 2>/dev/null)" = "$_agent" ] || return 1
+    [ "$(agmsg_role_session_get "$_team" "$_agent" type 2>/dev/null)" = claude-code ] || return 1
+    [ -n "$(agmsg_role_session_get "$_team" "$_agent" messaging_socket 2>/dev/null)" ] || return 1
+    [ -n "$(agmsg_role_session_get "$_team" "$_agent" claude_config_dir 2>/dev/null)" ] || return 1
+    [ "$(agmsg_role_session_get "$_team" "$_agent" project 2>/dev/null)" = "$_canon_project" ] || return 1
+  done <<< "$PAIRS"
+  [ "$_any" -eq 1 ]
+}
+
+_watch_renew_or_stop() {
+  local elapsed=$((SECONDS + _WATCH_ELAPSED_BASE)) cmd desc arg
+  [ "$elapsed" -ge "$WATCH_MAX_SECONDS" ] || return 0
+  if _agmsg_watch_native_delivery_active; then
+    watch_report "stopping - this seat's delivery has moved to agmsgd's native channel, so this watch is not re-armed"
+    exit 0
+  fi
+  if [ "$_WATCH_DELIVERED" -gt 0 ] || [ -n "${AGMSG_CC_MONITOR_KEEP_ALIVE:-}" ]; then
+    cmd="$(printf '%q' "$SCRIPT_DIR/watch.sh")"
+    for arg in "${ORIG_ARGS[@]}"; do
+      cmd="$cmd $(printf '%q' "$arg")"
+    done
+    desc="agmsg inbox stream"
+    [ -n "$ACTIVE_NAME" ] && desc="$desc (acting as $ACTIVE_NAME)"
+    watch_report "re-arm - this watch is about to reach the host's time cap; invoke the Monitor tool again with command: $cmd description: $desc persistent: true timeout_ms: 1800000"
+  else
+    watch_report "stopping - no messages were delivered in the last ${elapsed}s, so this watch is not re-armed (set AGMSG_CC_MONITOR_KEEP_ALIVE to keep it running)"
+  fi
+  exit 0
+}
+
 while true; do
+  # Renewal point: see _watch_renew_or_stop above.
+  [ -n "$WATCH_MAX_SECONDS" ] && _watch_renew_or_stop
   # Advance the per-cycle cache epoch as a PLAIN STATEMENT (never via $(...) —
   # see the actas-lock cache warming below for why): this is what lets
   # _agmsg_partition_load's per-team driver cache (lib/storage.sh) reuse one
@@ -1518,6 +1680,7 @@ EOF
         cleanup
         exit 0
       fi
+      _WATCH_DELIVERED=$((_WATCH_DELIVERED + 1))
       DELIVERED_IDS+=("$id")
     done <<< "$ROWS"
     # Second test seam, parked BETWEEN delivery and consume. One barrier cannot
@@ -1625,7 +1788,10 @@ EOF
           FINAL_CURSOR="${FINAL_CURSOR%%'"'*}"
           ;;
       esac
-      if [ -n "$FINAL_CURSOR" ]; then
+      # With no delivered IDs and an unchanged frontier, consume would only
+      # take a write transaction to store MAX(position, position). Re-read the
+      # frontier next cycle as usual; only a changed cursor needs consuming.
+      if [ -n "$FINAL_CURSOR" ] && [ "$FINAL_CURSOR" != "$READ_CURSOR" ]; then
         # Consume (#983): the same re-verification the heavy path above does
         # immediately before advancing the read frontier — a pair that
         # changed hands is left entirely alone, cursor included, so the

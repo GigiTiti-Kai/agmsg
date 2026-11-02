@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Hooks and their child operations must not run user recovery notices.
+export AGMSG_DAEMON_NOTICE_SKIP=1
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "$0")" && pwd)/lib/compat.sh"
 
@@ -58,6 +60,11 @@ source "$SCRIPT_DIR/lib/terminal-context-line.sh"
 # Identity sanity check — no point launching a watcher with an empty pair set.
 PAIRS=$("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE" 2>/dev/null || true)
 [ -n "$PAIRS" ] || exit 0
+
+# One-time introduction to agmsgd, for an install that has not turned it on.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/agmsgd-intro.sh"
+agmsg_agmsgd_intro_notice "$TYPE"
 
 # Read hook input JSON from stdin BEFORE the type plug below runs (#1468):
 # stdin can only be read once, and a plug that needs a hook input field (e.g.
@@ -440,42 +447,25 @@ if [ -n "$ROLE_NAME" ] && [ -n "$ROLE_TEAM" ]; then
 fi
 
 WATCH="$SKILL_DIR/scripts/watch.sh"
-# AGMSG_CC_MONITOR_KEEP_ALIVE, default OFF: timeout_ms: 1800000 always stays
-# in both directives below (the Monitor tool caps every watch there
-# regardless). What differs is whether re-arming on expiry is UNCONDITIONAL
-# or read off the expiry notification itself. Claude Code counts the events
-# on its own side and names that count in the notification -- agmsg never
-# counts it -- so the default case below is worded as a plain word match on
-# that notification ("no events" present or not), never as reading a
-# number: the exact phrasing may drift, and a seat that has to parse a
-# count is a seat this can break by rewording the notification later. Kept
-# word-for-word identical to scripts/delivery.sh's emit_monitor_directive
-# and scripts/drivers/types/claude-code/template.md's actas overlay -- the
-# three surfaces must never disagree with each other.
-REARM_NOTE=""
-if [ -n "${AGMSG_CC_MONITOR_KEEP_ALIVE:-}" ]; then
-  REARM_NOTE="
-This watch expires after at most 30 minutes; when the expiry notice arrives,
-immediately re-arm it by invoking Monitor again with this exact command and
-description — delivery depends on it, since nothing else keeps the stream
-running. Re-arm it silently: no message to the user, no \"re-armed\", no
-acknowledgement, no summary — just invoke Monitor again and continue,
-since announcing it every 30 minutes wastes tokens for no benefit."
-else
-  REARM_NOTE="
-This watch expires after at most 30 minutes.
-If the expiry notification says it delivered no events, do not re-arm it.
-Otherwise (it says it delivered something), re-arm it by invoking Monitor again with this exact command and description.
-Re-arm it silently, when you do: no message to the user, no \"re-armed\", no
-acknowledgement, no summary — just invoke Monitor again and continue, since
-announcing it every 30 minutes wastes tokens for no benefit."
-fi
+# The watch renews itself (scripts/watch.sh, _watch_renew_or_stop): when it was
+# launched with --max-seconds it prints one "re-arm" or "stopping" line
+# a little before Claude Code's 30-minute Monitor cap and exits, so the decision
+# is made by the watcher, not by the model reading an expiry notification later.
+# timeout_ms: 1800000 always stays in both directives below (the Monitor tool
+# caps every watch there regardless); AGMSG_CC_MONITOR_KEEP_ALIVE is read by the
+# watcher itself. Kept word-for-word identical to scripts/delivery.sh's
+# emit_monitor_directive and scripts/drivers/types/claude-code/template.md's
+# overlays -- the surfaces must never disagree with each other.
+REARM_NOTE="
+This watch renews itself. A little before the 30-minute cap it prints one line on its own and exits: on \`agmsg watch: re-arm - ...\`, invoke Monitor again with exactly the command and description that line names (persistent: true, timeout_ms: 1800000), silently — no message to the user, no \"re-armed\", no acknowledgement, no summary, since announcing it every 30 minutes wastes tokens for no benefit; on \`agmsg watch: stopping - ...\`, do not re-arm it. If the watch is instead killed at the cap and no such line arrived (an agmsg install from before this), re-arm it only when the expiry notification says it delivered something."
+# The launch commands below end with the option that turns self-management on.
+WATCH_MAX_ARG="--max-seconds=1750"
 # Shell-quote each argv so the host can paste the command into Monitor and run
 # it verbatim. A plain '...' wrap breaks on paths with an apostrophe
 # (/Users/o'brien/...); printf %q escapes spaces, quotes and other metacharacters
 # safely for shell re-execution (#188). A resumed role adds the 4th <agent> arg.
 if [ -n "$ROLE_NAME" ]; then
-  WATCH_COMMAND="$(printf '%q %q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE" "$ROLE_NAME")"
+  WATCH_COMMAND="$(printf '%q %q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE" "$ROLE_NAME") $WATCH_MAX_ARG"
   # State the seat's basis honestly: the reader launches a watcher on the strength
   # of this sentence, so a recorded seat and an inferred one must not read alike
   # (#982/#993). The record path has an explicit role-session record; the narrowing
@@ -511,11 +501,10 @@ monitor-branded tools are not valid for agmsg delivery. Do not start watch.sh
 with Bash/background/nohup or a shell task. Success is:
 
   - Monitor(agmsg inbox stream (acting as $ROLE_NAME)) starts
-  - TaskList shows a task whose description begins with "agmsg inbox
-    stream (acting as $ROLE_NAME)" for this session (the reliable check;
-    the background-task footer is not)
   - the transcript later contains Monitor event: "agmsg inbox stream
     (acting as $ROLE_NAME)"
+
+TaskList may list this task, but not every environment does (the desktop app's Code tab runs the Monitor and delivers its events without listing it), so a task missing from TaskList is not a failure: judge by the Monitor call starting and its events arriving. The background-task footer is not a reliable check either.
 
 If the generic Monitor tool is unavailable, do not treat a background shell
 watcher as success. Switch to turn delivery or run manual inbox checks instead;
@@ -543,7 +532,7 @@ fi
 # explicitly — which re-fires this hook down the role-filtered path above.
 _pair_count="$(printf '%s\n' "$PAIRS" | grep -c '.' || true)"
 if [ "${_pair_count:-0}" -le 1 ]; then
-  WATCH_COMMAND="$(printf '%q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE")"
+  WATCH_COMMAND="$(printf '%q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE") $WATCH_MAX_ARG"
   cat <<EOF
 $TERMINAL_LINE
 $TEAM_LINE
@@ -566,10 +555,9 @@ monitor-branded tools are not valid for agmsg delivery. Do not start watch.sh
 with Bash/background/nohup or a shell task. Success is:
 
   - Monitor(agmsg inbox stream) starts
-  - TaskList shows a task whose description begins with "agmsg inbox
-    stream" for this session (the reliable check; the background-task
-    footer is not)
   - the transcript later contains Monitor event: "agmsg inbox stream"
+
+TaskList may list this task, but not every environment does (the desktop app's Code tab runs the Monitor and delivers its events without listing it), so a task missing from TaskList is not a failure: judge by the Monitor call starting and its events arriving. The background-task footer is not a reliable check either.
 
 If the generic Monitor tool is unavailable, do not treat a background shell
 watcher as success. Switch to turn delivery or run manual inbox checks instead;

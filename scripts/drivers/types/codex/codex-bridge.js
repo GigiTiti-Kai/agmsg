@@ -1196,7 +1196,7 @@ class CodexBridge {
     if (!token) throw new Error("cannot determine process start token for identity lease");
     const host = os.hostname();
     if (!host) throw new Error("cannot determine hostname for identity lease");
-    const projectHash = crypto.createHash("sha1").update(this.opts.project).digest("hex");
+    const projectHash = crypto.createHash("sha1").update(toPosixPath(this.opts.project)).digest("hex");
     // Canonicalize the pair SET before hashing: hash each "team\tname" pair, then
     // sort the hex hashes (pure ASCII, so a byte sort in the launcher and a JS
     // code-unit sort here agree even for non-ASCII names) and hash the joined
@@ -1725,7 +1725,14 @@ class CodexBridge {
       // "No new messages." line is non-blank, passed tryStartTurn's emptiness
       // check, and became the entire prompt of an injected turn.
       const result = spawnSync(BASH_BIN, [path.join(SCRIPTS_DIR, "inbox.sh"), pair.team, pair.name, "--quiet"], { cwd: this.opts.project, encoding: "utf8" });
-      if (result.error || result.status !== 0) { console.error(`codex-bridge: inbox.sh failed for ${pair.team}/${pair.name}`); continue; }
+      if (result.error || result.status !== 0) {
+        // A team can disappear after eligibility was resolved. Skip that stale
+        // pair silently; other failures still deserve the bridge diagnostic.
+        if (!result.error && result.status === 1 &&
+            (result.stderr || "").trim() === `agmsg: team not found: ${pair.team}`) continue;
+        console.error(`codex-bridge: inbox.sh failed for ${pair.team}/${pair.name}`);
+        continue;
+      }
       if ((result.stdout || "").trim()) sections.push(result.stdout.trim());
     }
     return sections.join("\n\n");

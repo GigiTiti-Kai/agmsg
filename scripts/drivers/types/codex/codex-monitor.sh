@@ -103,6 +103,22 @@ esac
 
 PROJECT="$(cd "$PROJECT" && pwd)"
 
+# Direct monitor-wrapper users follow the same intent rule as shim users.
+# This path must run before creating the seat or any long-lived process.
+# shellcheck source=../../../lib/daemon-state.sh
+source "$SCRIPT_DIR/../../../lib/daemon-state.sh"
+agmsg_daemon_read_state
+agmsg_daemon_apply_project_choice codex "$PROJECT"
+if [ "${AGMSGD_DESIRED:-unknown}" = on ]; then
+  echo 'agmsgd handles Codex notices; starting plain Codex without a bridge.' >&2
+  agmsg_daemon_warn_if_stopped always
+  cd "$PROJECT"
+  case "$CODEX_COMMAND" in
+    codex) exec "$REAL_CODEX" ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"} ;;
+    resume) exec "$REAL_CODEX" resume ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"} ;;
+  esac
+fi
+
 # Fail-open: never let a broken bridge block codex. If the agmsg app-server can't
 # be brought up — e.g. a codex release changes the app-server interface and the
 # launch/port detection fails — hand off to a plain codex session (no --remote
@@ -127,9 +143,17 @@ exec_plain_codex() {
   fi
   echo "agmsg: Codex monitor bridge unavailable - launching plain Codex. Real-time agmsg delivery is OFF this session (messages still queue; check your inbox manually). Likely cause: the Codex app-server interface changed in 0.142+. Fix in progress." >&2
   cd "$PROJECT" 2>/dev/null || true
+  # On an elevated Windows shell a plain Codex refuses to start its shared
+  # background server, so this fallback names the flag Codex asks for.
+  local no_daemon=()
+  if [ -r "$SCRIPT_DIR/../../../lib/windows-elevation.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$SCRIPT_DIR/../../../lib/windows-elevation.sh"
+    agmsg_codex_plain_launch_wants_no_daemon ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"} && no_daemon=(--no-daemon)
+  fi
   case "$CODEX_COMMAND" in
-    codex)  exec "$REAL_CODEX" ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"} ;;
-    resume) exec "$REAL_CODEX" resume ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"} ;;
+    codex)  exec "$REAL_CODEX" ${no_daemon[@]+"${no_daemon[@]}"} ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"} ;;
+    resume) exec "$REAL_CODEX" ${no_daemon[@]+"${no_daemon[@]}"} resume ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"} ;;
   esac
 }
 
@@ -179,8 +203,21 @@ port_alive() {  # $1 = port; succeeds if something is accepting on 127.0.0.1:$1
 # under --remote) inherit THIS process's environment directly, which is the
 # whole point -- no ancestry walk is needed anywhere downstream to find a
 # seat's own server (design review, replacing an earlier ancestry-walk design).
+#
+# Also passed as a `shell_environment_policy.set` override: under a
+# `shell_environment_policy.inherit` other than the default "all" (e.g.
+# "core" or "none"), Codex 0.158+ no longer lets tool-command children see a
+# var the policy excludes, so the plain env var above stops reaching them.
+# `set` is applied after `inherit`/exclude, so this reaches the tool
+# environment regardless of `inherit`; a user's own `include_only` still
+# filters after `set` and must list the var themselves (#1537). The key is
+# generated internally as digits and dots only (_agmsg_codex_seat_key_new),
+# so it is always safe inside this double-quoted TOML string unescaped.
 AGMSG_CODEX_SEAT_KEY="$SEAT_KEY" \
-  "$REAL_CODEX" app-server --listen "ws://127.0.0.1:0" >>"$SEAT_LOG" 2>&1 3>&- 4>&- &
+  AGMSG_CODEX_BRIDGE_LAUNCHER=1 \
+  "$REAL_CODEX" app-server \
+    -c "shell_environment_policy.set.AGMSG_CODEX_SEAT_KEY=\"$SEAT_KEY\"" \
+    --listen "ws://127.0.0.1:0" >>"$SEAT_LOG" 2>&1 3>&- 4>&- &
 server_bg="$!"
 
 PORT=""
@@ -233,7 +270,31 @@ _agmsg_codex_seat_record_write "$SEAT_RECORD" "$PROJECT_HASH" "$server_bg" "$POR
   exec_plain_codex
 }
 
-"$SCRIPT_DIR/../../../delivery.sh" set monitor codex "$PROJECT" >/dev/null
+# `delivery.sh set monitor` rewrites .codex/hooks.json to the same content when
+# monitor delivery is already configured, and costs dozens of processes to find
+# that out -- seconds on Windows, paid on every launch. Skip it only when the
+# file is byte-for-byte what `set monitor` itself left the last time it ran for
+# this project under this install: the marker below holds that content plus the
+# install's location and VERSION, so an upgrade, a moved install, or any edit to
+# the file (a changed project, a missing commandWindows, a stale entry) is a
+# mismatch and runs the full set. No partial match is trusted. Read and written
+# with builtins: no process is started on the skip path.
+_hooks_file="$PROJECT/.codex/hooks.json"
+_hooks_marker="$RUN_DIR/codex-hooks-set.$PROJECT_HASH"
+_hooks_stamp=""
+read -r _hooks_stamp < "$SKILL_DIR/VERSION" 2>/dev/null || true
+_hooks_now=""
+_hooks_last=""
+IFS= read -r -d '' _hooks_now < "$_hooks_file" 2>/dev/null || true
+IFS= read -r -d '' _hooks_last < "$_hooks_marker" 2>/dev/null || true
+if [ -n "$_hooks_now" ] && [ "$_hooks_last" = "$SKILL_DIR"$'\n'"$_hooks_stamp"$'\n'"$_hooks_now" ]; then
+  :
+else
+  "$SCRIPT_DIR/../../../delivery.sh" set monitor codex "$PROJECT" >/dev/null
+  _hooks_now=""
+  IFS= read -r -d '' _hooks_now < "$_hooks_file" 2>/dev/null || true
+  printf '%s\n%s\n%s' "$SKILL_DIR" "$_hooks_stamp" "$_hooks_now" > "$_hooks_marker" 2>/dev/null || true
+fi
 
 export AGMSG_CODEX_BRIDGE=1
 export AGMSG_CODEX_BRIDGE_APP_SERVER="$SOCKET_URL"

@@ -91,6 +91,7 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
     . "$LOCKLIB"
     agmsg_lock_acquire "$TEAM_DIR" || exit 1
     [ -d "$TEAM_DIR/.config.lock" ] || exit 2
+    [ -f "$TEAM_DIR/.config.lock/.owner" ] || exit 4
     agmsg_lock_release
     [ ! -d "$TEAM_DIR/.config.lock" ] || exit 3
   '
@@ -109,6 +110,29 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
   [ "$status" -eq 0 ]
   grep -qE "^pid [0-9]+$" <<<"$output"
   grep -q "^command " <<<"$output"
+  grep -q "^token ." <<<"$output"
+  grep -q "^host ." <<<"$output"
+
+  # And a process killed while it is still making the token (od is slowed to a
+  # crawl) must leave either a lock WITH its record or no lock at all -- never
+  # the directory alone, which nothing can tell from a lock taken a moment ago
+  # and so nothing ever breaks.
+  local shims="$BATS_TEST_TMPDIR/shims" pid
+  mkdir -p "$shims" "$BATS_TEST_TMPDIR/teams/killed"
+  printf '#!/bin/sh\nsleep 3\n' > "$shims/od"
+  chmod +x "$shims/od"
+  env PATH="$shims:$PATH" LOCKLIB="$LOCKLIB" TEAM_DIR="$BATS_TEST_TMPDIR/teams/killed" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$TEAM_DIR"
+    sleep 30
+  ' >/dev/null 2>&1 3>&- 4>&- &
+  pid=$!
+  sleep 1
+  kill -9 "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  if [ -d "$BATS_TEST_TMPDIR/teams/killed/.config.lock" ]; then
+    [ -f "$BATS_TEST_TMPDIR/teams/killed/.config.lock.holder" ]
+  fi
 }
 
 @test "lock: a lock that cannot be released says so, and the way out works (#778)" {
@@ -379,4 +403,177 @@ acquire() {  # runs the acquire in its own shell, with a short spin budget
   [ "$status" -eq 0 ]
   grep -q "^survived$" <<<"$output"
   [ ! -d "$TEAM_DIR/.config.lock" ]
+}
+
+# --- breaking a lock only when its holder is known to be gone (#865) ---------
+#
+# A killed holder leaves its directory behind and nothing ever removed it, so
+# the team stayed wedged until someone deleted it by hand. The lock is now
+# broken when the record beside it names a process on THIS machine that is not
+# running. Everything else stays put, and the case that matters most is in the
+# same run: taking a lock somebody IS using is worse than the leak.
+#
+# The order inside the library is claim first, judge second (rename the record
+# away, then ask whether its process is running, and put it back if so); that
+# is what lets two breakers race without one removing the directory a new owner
+# has just taken. This test does not cover that order: the wrong order only
+# shows up as a lost exclusion under one particular interleaving, which needs
+# the two processes held at specific points to reproduce.
+@test "lock: a dead holder's lock is broken; a live holder's, another machine's record and a record-less lock are kept (#865)" {
+  local gone live lock="$TEAM_DIR/.config.lock" me
+  me="$(uname -n)"
+  sleep 0 &
+  gone=$!
+  wait "$gone" 2>/dev/null || true
+  sleep 30 &
+  live=$!
+  # CONTROLS: the dead pid is really not running and the live one really is.
+  # Without them the "kept" cases pass whenever the number happens to be free.
+  run env PID="$gone" LOCKLIB="$LOCKLIB" bash -c '. "$LOCKLIB"; _agmsg_lock_load_liveness; _agmsg_pid_alive_local "$PID"'
+  [ "$status" -ne 0 ]
+  run env PID="$live" LOCKLIB="$LOCKLIB" bash -c '. "$LOCKLIB"; _agmsg_lock_load_liveness; _agmsg_pid_alive_local "$PID"'
+  [ "$status" -eq 0 ]
+
+  # A live holder on this machine: kept.
+  mkdir "$lock"
+  printf 'token t\npid %s\ncommand t\nhost %s\n' "$live" "$me" > "$lock.holder"
+  acquire
+  [ "$status" -ne 0 ]
+  grep -qF "timed out acquiring registry lock" <<<"$output"
+  refute grep -qF "broke a registry lock" <<<"$output"
+  [ -d "$lock" ]
+  [ -f "$lock.holder" ]
+
+  # The same dead number in a record another machine wrote: that machine's
+  # table is the one that knows, so it is kept.
+  printf 'token t\npid %s\ncommand t\nhost some-other-machine\n' "$gone" > "$lock.holder"
+  acquire
+  [ "$status" -ne 0 ]
+  refute grep -qF "broke a registry lock" <<<"$output"
+  grep -qF "not written on this machine" <<<"$output"
+  [ -d "$lock" ]
+
+  # No record at all: kept, and the timeout says how to remove it.
+  rm -f "$lock.holder"
+  acquire
+  [ "$status" -ne 0 ]
+  refute grep -qF "broke a registry lock" <<<"$output"
+  grep -qF "records no holder" <<<"$output"
+  grep -qF "rmdir" <<<"$output"
+  [ -d "$lock" ]
+
+  # A record whose pid is not a usable number (zero, text, past the ceiling) on
+  # this machine: "cannot tell", never "dead". The liveness helper answers "not
+  # running" for these without ever asking the process table.
+  local bad
+  for bad in 0 abc 99999999999; do
+    printf 'token t\npid %s\ncommand t\nhost %s\n' "$bad" "$me" > "$lock.holder"
+    acquire
+    [ "$status" -ne 0 ]
+    refute grep -qF "broke a registry lock" <<<"$output"
+    [ -d "$lock" ]
+  done
+  rm -f "$lock.holder"
+
+  # The copy a release leaves when it is killed after moving its record aside is
+  # not a record of THIS directory (a normal release can leave one too, and a
+  # new owner that stopped right after its mkdir would be judged by it), so it
+  # is treated like no record at all.
+  printf 'token t\npid %s\ncommand t\nhost %s\n' "$gone" "$me" > "$lock.holder.releasing.$gone"
+  acquire
+  [ "$status" -ne 0 ]
+  refute grep -qF "broke a registry lock" <<<"$output"
+  [ -d "$lock" ]
+  rm -f "$lock.holder.releasing.$gone"
+  rmdir "$lock"
+
+  # The same leftover on a directory that is over a minute old and no newer than
+  # the staged copy (the release was interrupted): broken when the copy is
+  # readable, says this machine and names a pid that is not running. A live
+  # owner's copy, and a copy that cannot be read (it cannot say which machine
+  # wrote it), keep the lock.
+  mkdir "$lock"
+  printf 'token t\npid %s\ncommand t\nhost %s\n' "$live" "$me" > "$lock.holder.releasing.$live"
+  touch -t 202601010000 "$lock"
+  touch -t 202601010001 "$lock.holder.releasing.$live"
+  acquire
+  [ "$status" -ne 0 ]
+  refute grep -qF "broke a registry lock" <<<"$output"
+  rm -f "$lock.holder.releasing.$live"
+  : > "$lock.holder.releasing.$gone"
+  touch -t 202601010001 "$lock.holder.releasing.$gone"
+  acquire
+  [ "$status" -ne 0 ]
+  refute grep -qF "broke a registry lock" <<<"$output"
+  grep -qF "a release was interrupted" <<<"$output"
+  [ -d "$lock" ]
+  printf 'token t\npid %s\ncommand t\nhost %s\n' "$gone" "$me" > "$lock.holder.releasing.$gone"
+  touch -t 202601010001 "$lock.holder.releasing.$gone"
+  # Two staged copies are ambiguous (two breakers could claim one each): kept.
+  printf 'token t\npid %s\ncommand t\nhost %s\n' "$((gone + 1))" "$me" > "$lock.holder.releasing.$((gone + 1))"
+  touch -t 202601010001 "$lock.holder.releasing.$((gone + 1))"
+  acquire
+  [ "$status" -ne 0 ]
+  refute grep -qF "broke a registry lock" <<<"$output"
+  rm -f "$lock.holder.releasing.$((gone + 1))"
+  acquire
+  [ "$status" -eq 0 ]
+  grep -qF "release was interrupted" <<<"$output"
+  [ ! -e "$lock.holder.releasing.$gone" ]
+
+  # A dead holder with the new owner marker is still reclaimable.
+  mkdir "$lock"
+  : > "$lock/.owner"
+  printf 'token t\npid %s\ncommand t\nhost %s\n' "$gone" "$me" > "$lock.holder"
+  acquire
+  [ "$status" -eq 0 ]
+  grep -qF "broke a registry lock" <<<"$output"
+
+  kill "$live" 2>/dev/null || true
+}
+
+@test "lock: a vanished namespace after marker release never restores an old holder" {
+  run env LOCKLIB="$LOCKLIB" TEAM_DIR="$TEAM_DIR" bash -c '
+    . "$LOCKLIB"
+    agmsg_lock_acquire "$TEAM_DIR" || exit 1
+    rmdir() {
+      # A delayed contender has taken and released the marker and namespace.
+      command rmdir "$1" || return 1
+      return 1
+    }
+    mv() {
+      case "$1" in
+        *.holder.releasing.*)
+          # The next owner arrives just before the old rollback would overwrite it.
+          command mkdir "$TEAM_DIR/.config.lock"
+          : > "$TEAM_DIR/.config.lock/.owner"
+          printf "token SUCCESSOR\n" > "$TEAM_DIR/.config.lock.holder"
+          : > "$TEAM_DIR/rollback-attempted" ;;
+      esac
+      command mv "$@"
+    }
+    agmsg_lock_release
+    [ ! -e "$TEAM_DIR/rollback-attempted" ] || exit 2
+    [ ! -e "$TEAM_DIR/.config.lock.holder" ] || exit 3
+  '
+  [ "$status" -eq 0 ]
+}
+
+@test "lock: the timeout remedy removes a stale owner marker and preserves team data" {
+  local component remedy
+  for component in "team space \$literal" "team 'quote' \$literal"; do
+    TEAM_DIR="$BATS_TEST_TMPDIR/$component"
+    mkdir -p "$TEAM_DIR/.config.lock"
+    : > "$TEAM_DIR/.config.lock/.owner"
+    printf '%s\n' preserved > "$TEAM_DIR/config.json"
+    TRIES=1 acquire
+    [ "$status" -ne 0 ]
+    [ -f "$TEAM_DIR/.config.lock/.owner" ]
+    remedy="$(printf '%s\n' "$output" | sed -n 's/^agmsg:   //p' | tail -1)"
+    [ -n "$remedy" ]
+    run bash -c "$remedy"
+    [ "$status" -eq 0 ]
+    [ ! -d "$TEAM_DIR/.config.lock" ]
+    [ "$(cat "$TEAM_DIR/config.json")" = preserved ]
+  done
 }

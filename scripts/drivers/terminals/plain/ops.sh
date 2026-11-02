@@ -251,6 +251,10 @@ _plain_spawn_locator() {
     printf 'plain: spawned window returned an invalid owner pid\n' >&2
     return 13 ;;
   esac
+  # The witness is written with LC_ALL=C (spawn.sh), so it is always the English
+  # form of ps's lstart. Do not widen this to other characters: every reader
+  # (here, _plain_process_witness_matches, terminal_fence) asks ps under LC_ALL=C
+  # too, and the value is only ever compared byte for byte.
   case "$start" in *[!0-9A-Za-z_:]*)
     printf 'plain: spawned window returned an invalid owner start time\n' >&2
     return 13 ;;

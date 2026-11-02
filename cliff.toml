@@ -68,6 +68,12 @@ commit_parsers = [
   { message = "^fix\\(app\\): build the spawn prompt from each type's own", skip = true },
   { message = "^fix\\(app\\): open a clicked agent in the tab being viewed", skip = true },
   { message = "^fix\\(app\\): keep a renamed team's open tabs", skip = true },
+  # After 1.5.1: app and site changes ship outside the npm package (the next
+  # app release and the project site), not in the CLI.
+  { message = "^fix\\(app\\): bundle SKILL.md and the other files the installer reads", skip = true },
+  { message = "^fix\\(app\\): keep the sidebar user block and settings gear", skip = true },
+  { message = "^fix\\(app\\): emit each message once when events and legacy rows", skip = true },
+  { message = "^fix\\(site\\): bump Astro for GHSA-26w7-cxv4-gfx2", skip = true },
   { message = "^feat", group = "<!-- 0 -->Added" },
   { message = "^fix", group = "<!-- 1 -->Fixed" },
   { message = "^perf", group = "<!-- 2 -->Performance" },
@@ -90,6 +96,14 @@ commit_parsers = [
 { message = "^sync-cipher: tolerate unknown message fields on receive", group = "<!-- 1 -->Fixed" },
 { message = "^codex: one app-server per seat, never shared", group = "<!-- 1 -->Fixed" },
 { message = "^plain driver: an agent-native substitute for peek/poke with no pane", group = "<!-- 0 -->Added" },
+# 1.6.0 agmsgd beta: squash subjects without a conventional prefix.
+{ message = "^agmsgd beta: skeleton", group = "<!-- 0 -->Added" },
+{ message = "^Add Codex queue delivery and seat status", group = "<!-- 0 -->Added" },
+{ message = "^Add daemon beta switching and recovery guidance", group = "<!-- 0 -->Added" },
+{ message = "^Allow Windows Codex queue from the measured minimum release", group = "<!-- 0 -->Added" },
+# 1.6.0 fixes merged to main with a component prefix instead of a conventional one.
+{ message = "^sync-autostart: remove the two temp files once the slow child finishes", group = "<!-- 1 -->Fixed" },
+{ message = "^lock: leave no window between taking a registry lock and recording its holder", group = "<!-- 1 -->Fixed" },
   # 1.4.0's jev work was squashed with a "jev:" subject rather than a
   # Conventional prefix, so the catch-all below would drop it — including the
   # second provider, the most user-visible jev change in the release. Same

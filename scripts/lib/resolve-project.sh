@@ -251,13 +251,15 @@ agmsg_find_registered_project_variant() {
 # always eligible, not checked here since it is never itself an override
 # source), then $root/plugins, then each $AGMSG_PLUGIN_DIRS entry.
 _agmsg_type_external_candidate() {
-  local type="$1" root="${SKILL_DIR:-}" d
+  local type="$1" root="${SKILL_DIR:-}" kind base
   [ -n "$root" ] || return 1
-  [ -f "$root/plugins/types/$type/type.conf" ] && return 0
-  local IFS=:
-  for d in ${AGMSG_PLUGIN_DIRS:-}; do
-    [ -n "$d" ] && [ -f "$d/types/$type/type.conf" ] && return 0
-  done
+  declare -F agmsg_driver_bases >/dev/null 2>&1 \
+    || . "$root/scripts/lib/driver-registry.sh" 2>/dev/null || return 1
+  while IFS=$'\t' read -r kind base; do
+    [ "$kind" = external ] && [ -f "$base/types/$type/type.conf" ] && return 0
+  done <<EOF
+$(agmsg_driver_bases)
+EOF
   return 1
 }
 
@@ -459,6 +461,21 @@ agmsg_pid_is_agent() {
   return 1
 }
 
+# Print the Windows pid of the nearest ancestor of this shell whose image name is
+# <image> (e.g. claude.exe), asking Windows because Git Bash's ps stops at the
+# native parent. Empty and non-zero when there is none or CIM is unavailable.
+_agmsg_msys_ancestor_pid() {   # <image>
+  local image="$1" winpid found
+  [ -z "${_AGMSG_COMPAT_NO_CIM:-}" ] || return 1
+  winpid="$(_compat_get_winpid "$$" 2>/dev/null)"
+  case "$winpid" in ''|*[!0-9]*) return 1 ;; esac
+  found="$(powershell.exe -NoProfile -Command \
+    "\$id=$winpid; for(\$i=0;\$i -lt 16 -and \$id;\$i++){ \$p=Get-CimInstance Win32_Process -Filter \"ProcessId=\$id\"; if(-not \$p){break}; if(\$p.Name -ieq '$image'){\$p.ProcessId;break}; \$id=\$p.ParentProcessId }" \
+    2>/dev/null | tr -d '\r')"
+  case "$found" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$found"
+}
+
 # Walk the process tree from $$ upward, echoing the PID of the nearest ancestor
 # that looks like an agent process of <type>. Empty (return 1) when none is
 # found — e.g. a detached watcher or a plain human shell.
@@ -479,6 +496,31 @@ agmsg_agent_pid() {
         return 1 ;;
       *) printf '%s' "$AGMSG_AGENT_PID"; return 0 ;;
     esac
+  fi
+  # Git Bash's ps lists MSYS pids only, so the walk below never sees the native
+  # claude.exe and every Claude Code seat would fall back to the bare session id
+  # (#1585). Claude Code exports its own pid as CLAUDE_PID; on Windows only, take
+  # it when it names a live process. Claude Code re-exports it at its own
+  # startup, so a value inherited from a spawner is replaced before any seat
+  # runs. Elsewhere the walk finds the agent, so behaviour there is unchanged.
+  if [ "$type" = "claude-code" ]; then
+    _agmsg_detect_platform
+    case "$_agmsg_platform:${CLAUDE_PID:-}" in
+      msys:''|msys:0*|msys:*[!0-9]*) ;;
+      msys:*) if _agmsg_pid_alive "${CLAUDE_PID:-}" 2>/dev/null; then
+                printf '%s' "${CLAUDE_PID:-}"; return 0
+              fi ;;
+    esac
+    # A hook does not get CLAUDE_PID (only the Bash tool does), and Git Bash's ps
+    # cannot see claude.exe, so a SessionStart hook found no seat pid and the
+    # seat's delivery record was never written on --resume. Ask Windows for the
+    # nearest claude.exe ancestor instead.
+    if [ "$_agmsg_platform" = msys ]; then
+      local native
+      native="$(_agmsg_msys_ancestor_pid claude.exe)" && [ -n "$native" ] && {
+        printf '%s' "$native"; return 0
+      }
+    fi
   fi
   local pid="$$" hops=0
   while [ "${pid:-0}" -gt 1 ] && [ "$hops" -lt 20 ]; do

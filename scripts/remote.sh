@@ -2476,12 +2476,12 @@ cmd_connect() {
       'team_id', json_extract('$cfg_escaped', '\$.team_id'),
       'team_name', json_extract('$cfg_escaped', '\$.name'),
       'cipher_profile', '$binding_cipher',
-      'members', coalesce(
+      'members', json(coalesce(
         (SELECT json_group_array(json_object(
             'member_id', json_extract(value, '\$.member_id'),
             'name', key))
            FROM json_each(json_extract('$cfg_escaped', '\$.agents'))),
-        json('[]'))
+        '[]'))
     );" > "$body_file"
 
   # A connect that already registered this team here must not register it
@@ -2743,6 +2743,13 @@ _remote_status_one() {
       echo "		last fatal: $fatal_msg"
     fi
   fi
+  # A roster state file the engine could not read is set aside and rebuilt; say
+  # so, so a reset never passes unseen. The set-aside copy is never deleted here.
+  local _reset_file
+  for _reset_file in "$TEAMS_DIR/$team"/roster-sync.json.corrupt-*; do
+    [ -e "$_reset_file" ] || continue
+    echo "		roster state was reset: unreadable copy kept at $_reset_file (delete it once the roster looks right)"
+  done
   # Connected, and unable to name anybody.
   #
   # `status` could say "engine running" indefinitely while `team.sh` said
@@ -2990,7 +2997,7 @@ cmd_status() {
     fi
     case "$rc" in
       0) : ;;
-      2) echo "agmsg: team '$team' could not be read -- its config exists but could not be parsed (or its lock could not be acquired); connection state is unknown, not confirmed unconnected (#650)" >&2; exit 2 ;;
+      2) echo "agmsg: team '$team' could not be read -- its config exists but could not be parsed (or its lock could not be acquired -- doctor.sh lists registry locks with no holder record and prints the rmdir line); connection state is unknown, not confirmed unconnected (#650)" >&2; exit 2 ;;
       *) echo "agmsg: team '$team' has never been connected" >&2; exit 1 ;;
     esac
     return
@@ -3901,7 +3908,18 @@ cmd_set_endpoint() {
   # and this write must refuse rather than overwrite that newer state -- the
   # adopt path rewrites the whole binding, disconnected_at:null included.
   _remote_adopt_registration "$team" "$cfg" "$endpoint" "$remote_team_id" \
-    "$binding_cipher" "$server_instance" "$binding_revision" || exit 1
+    "$binding_cipher" "$server_instance" "$binding_revision" || {
+    # A refusal writes nothing, so the binding is as it was: put the engine
+    # back rather than leave a refused move to stop sync silently (#1512).
+    if [ "$was_running" -eq 1 ]; then
+      if _remote_sync_engine_start "$team"; then
+        echo "agmsg: the binding was not changed; the sync engine was restarted." >&2
+      else
+        echo "agmsg: the binding was not changed, but the sync engine is stopped; start it with: remote.sh sync start $(agmsg_shq "$team")" >&2
+      fi
+    fi
+    exit 1
+  }
 
   # Two places pin the address: the binding (moved above) and the stored sync
   # config, whose server_url loadConfig requires to match the binding. The

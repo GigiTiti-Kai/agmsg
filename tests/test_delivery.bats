@@ -272,6 +272,33 @@ settings_file() {
   local n
   n=$(sqlite_mem "SELECT count(*) FROM json_each(json_extract(readfile('$(rf "$(settings_file)")'), '\$.hooks.SessionStart'));")
   [ "$n" -eq 2 ]
+  # The event stays a JSON array (a subquery result passed to json_set() as
+  # plain text would be stored as a string on newer SQLite), through the
+  # strip on the way out as well.
+  [ "$(sqlite_mem "SELECT json_type(readfile('$(rf "$(settings_file)")'), '\$.hooks.SessionStart');")" = array ]
+  run bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [ "$(sqlite_mem "SELECT json_type(readfile('$(rf "$(settings_file)")'), '\$.hooks.SessionStart');")" = array ]
+  grep -q "${skill_name}-my-wrapper.sh" "$(settings_file)"
+
+  # A file an affected version already corrupted (the array stored as a
+  # string) is restored by the next set, with the user's hook intact.
+  printf '%s' '{"hooks":{"SessionStart":"[{\"hooks\":[{\"type\":\"command\",\"command\":\"'"$TEST_PROJECT"'/scripts/'"$skill_name"'-my-wrapper.sh\"}]}]"}}' \
+    > "$(settings_file)"
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [ "$(sqlite_mem "SELECT json_type(readfile('$(rf "$(settings_file)")'), '\$.hooks.SessionStart');")" = array ]
+  grep -q "${skill_name}-my-wrapper.sh" "$(settings_file)"
+  has_session_start "$(settings_file)"
+
+  # An event that is not an array (an object here) is refused, naming the file
+  # and event, and the file is not touched.
+  printf '%s' '{"hooks":{"SessionStart":{"user":"kept"}}}' > "$(settings_file)"
+  cp "$(settings_file)" "$BATS_TEST_TMPDIR/object-event.json"
+  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
+  [ "$status" -ne 0 ]
+  grep -qF "$(settings_file): hooks.SessionStart is not an array" <<<"$output"
+  cmp "$(settings_file)" "$BATS_TEST_TMPDIR/object-event.json"
 }
 
 @test "delivery set monitor: round-trips multibyte (UTF-8) settings without a short-write reject" {
@@ -318,7 +345,7 @@ settings_file() {
   # claude-code-only note points at TaskList, not the background-task footer
   # (#270).
   grep -qF -- "configured hooks only" <<<"$output"
-  [[ "$output" == *"Verify with TaskList"* ]]
+  grep -qF -- "a task missing from TaskList is not a failure" <<<"$output"
 }
 
 # A pid that exists but this user cannot signal, so `kill -0` fails with EPERM
@@ -403,6 +430,36 @@ eperm_pid() {
     || { echo "expected the first line to read 'mode: off (...)', got: $output" >&2; return 1; }
   [[ "$output" == *"unrecognized"* ]] &&
     [[ "$output" == *"$TEST_PROJECT"* ]]
+}
+
+@test "delivery status: a Codex project with no hooks file reads as agmsgd-delivered only while agmsgd is on and its seats have destinations" {
+  export SKILL_DIR="$TEST_SKILL_DIR"
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  grep -q '^mode: off (unrecognized: no settings file found' <<<"$output"
+
+  mkdir -p "$TEST_SKILL_DIR/run"
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" < "$SCRIPTS/daemon/schema.sql"
+  local boot
+  case "$(uname -s)" in
+    Darwin) boot="$(sysctl -n kern.bootsessionuuid)" ;;
+    Linux) boot="$(sed -n 's/^btime //p' /proc/stat)" ;;
+    *) skip 'POSIX beta executor evidence' ;;
+  esac
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_intent SET desired='on';
+    UPDATE daemon_owner SET state='ready', executor_pid=$$, executor_boot_id='$boot', executor_started_at=strftime('%Y-%m-%dT%H:%M:%fZ','now');"
+  # agmsgd on, but alice has no recorded destination yet: unchanged.
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  grep -q '^mode: off (unrecognized: no settings file found' <<<"$output"
+
+  source "$SCRIPTS/lib/role-session.sh"
+  agmsg_role_session_record team alice thread-1 "$TEST_PROJECT" codex "" "$TEST_PROJECT/codex-home"
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  [ "${output%%$'\n'*}" = "mode: agmsgd (agmsgd delivers to this project's Codex seats; no hooks file needed)" ]
+
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_intent SET desired='off';"
+  run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
+  grep -q '^mode: off (unrecognized: no settings file found' <<<"$output"
 }
 
 @test "delivery status: a settings file that exists but is not valid JSON is also unrecognized, not deliberate off (review)" {
@@ -605,29 +662,25 @@ eperm_pid() {
   # the 5-minute default -- timeout_ms is unconditional, present regardless
   # of AGMSG_CC_MONITOR_KEEP_ALIVE below.
   grep -q 'timeout_ms: 1800000' <<<"$output"
-  # AGMSG_CC_MONITOR_KEEP_ALIVE, default OFF: with it unset (the run above),
-  # the directive must carry the CONDITIONAL re-arm wording -- a plain word
-  # match on "no events" in Claude Code's own expiry notification, never a
-  # count to parse (the notification's exact phrasing may drift; #1270's
-  # count only ever appears as Claude Code's own text, agmsg does not count
-  # it). The unconditional wording ("immediately re-arm it") is reserved for
-  # KEEP_ALIVE, checked below.
-  refute grep -q 'immediately re-arm it by invoking Monitor again' <<<"$output"
-  grep -q 'says it delivered no events, do not re-arm it' <<<"$output"
-  grep -q 'Otherwise (it says it delivered something), re-arm it' <<<"$output"
-  grep -q 'Re-arm it silently' <<<"$output"
-
-  run env AGMSG_CC_MONITOR_KEEP_ALIVE=1 bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
-  [ "$status" -eq 0 ]
-  grep -q 'timeout_ms: 1800000' <<<"$output"
-  grep -q 'immediately re-arm it by invoking Monitor again' <<<"$output"
-  # KEEP_ALIVE re-arms unconditionally, regardless of what the expiry
-  # notification says -- the conditional wording above must not appear here.
+  # The watch renews itself: the launch command carries --max-seconds, and the
+  # directive tells the host to follow the watcher's own last line ("re-arm" /
+  # "stopping") instead of reading Claude Code's expiry notification.
+  # AGMSG_CC_MONITOR_KEEP_ALIVE is read by the watcher, so the directive text
+  # is the same with or without it.
+  grep -q 'watch.sh .* --max-seconds=1750' <<<"$output"
+  grep -q 'This watch renews itself' <<<"$output"
+  grep -qF 'agmsg watch: re-arm - ...' <<<"$output"
+  grep -qF 'agmsg watch: stopping - ...' <<<"$output"
+  grep -qF 'no acknowledgement, no summary' <<<"$output"
   refute grep -q 'says it delivered no events, do not re-arm it' <<<"$output"
   # The maintainer's follow-up to #1270: an agent that announces every silent
   # re-arm ("re-armed", an acknowledgement, a summary) burns tokens every 30
   # minutes for no reader benefit, so the directive must say to do it quietly.
-  [[ "$output" =~ "Re-arm it silently" ]]
+  run env AGMSG_CC_MONITOR_KEEP_ALIVE=1 bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  grep -q 'timeout_ms: 1800000' <<<"$output"
+  grep -q 'This watch renews itself' <<<"$output"
+  grep -qF 'no acknowledgement, no summary' <<<"$output"
 }
 
 @test "delivery set both: emits AGMSG-DIRECTIVE for Monitor invocation" {
@@ -874,7 +927,8 @@ _seed_role_record() {
   # Generic directive: watch.sh has no 4th (role) arg.
   local cmdline; cmdline=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*command: //p')
   eval "set -- $cmdline"
-  [ "$#" -eq 4 ]
+  [ "$#" -eq 5 ]
+  [ "$5" = "--max-seconds=1750" ]
 }
 
 @test "session-start: a record for a role not registered here is ignored (#339)" {
@@ -1676,7 +1730,9 @@ EOF
   # issue's own FIFO repro. A plain `sleep N | check-inbox.sh` does NOT
   # reproduce this: bash waits for every pipeline member, so it looks like a
   # hang even when the hook itself exits immediately.
-  { printf '%s' '{"stop_hook_active":false,"session_id":"repro-381"}'; sleep 300; } \
+  # Replace the writer shell so killing writer_pid also closes inherited Bats
+  # descriptors, instead of leaving an orphan sleep holding the runner open.
+  { printf '%s' '{"stop_hook_active":false,"session_id":"repro-381"}'; exec sleep 300; } \
     3>&- 4>&- > "$fifo" &
   local writer_pid="$!"
 
@@ -1684,6 +1740,7 @@ EOF
   run bash -c "PATH='$newpath' AGMSG_HOOK_STDIN_TIMEOUT=1 bash '$SCRIPTS/check-inbox.sh' claude-code '$TEST_PROJECT' < '$fifo'"
 
   kill "$writer_pid" 2>/dev/null || true
+  wait "$writer_pid" 2>/dev/null || true
   rm -f "$fifo"
 
   [ "$status" -eq 0 ]
@@ -1736,7 +1793,8 @@ JSON
   wait "$pid" 2>/dev/null || true
 
   grep -q "new-for-bob"   /tmp/agmsg-as-bob
-  ! grep -q "new-for-alice" /tmp/agmsg-as-bob
+  ! grep -q "new-for-alice" /tmp/agmsg-as-bob \
+    || { echo "forbidden message leaked to bob" >&2; rm -f /tmp/agmsg-as-bob; return 1; }
   rm -f /tmp/agmsg-as-bob
 }
 
@@ -2885,6 +2943,83 @@ EOF
     bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT" >/dev/null
 
   [ ! -f "$log" ]
+}
+
+@test "session-start.sh for codex does not choose a /clear seat by process: with several seats none moves, even one whose owner names the same live pid (#1468)" {
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" team bob codex "$TEST_PROJECT" >/dev/null
+  local old=11111111-1111-4111-8111-111111111111 new=22222222-2222-4222-8222-222222222222
+  local rec_a="$TEST_SKILL_DIR/run/role-session.team__alice" rec_b="$TEST_SKILL_DIR/run/role-session.team__bob"
+  # Seats of a profile run under one app-server daemon, so a stale owner left
+  # on one seat names the pid every seat resolves to, and that pid stays alive
+  # across the /clear. The other seat (the one actually cleared) has no owner.
+  sleep 60 &
+  local pid=$!
+  SKILL_DIR="$TEST_SKILL_DIR" bash -c '
+    source "$1/lib/role-session.sh"
+    agmsg_role_session_record team alice "$2" "$4" codex "$2.$5"
+    agmsg_role_session_record team bob "$3" "$4" codex
+  ' _ "$SCRIPTS" "$old" "33333333-3333-4333-8333-333333333333" "$TEST_PROJECT" "$pid"
+  local before_a before_b
+  before_a="$(cat "$rec_a")"; before_b="$(cat "$rec_b")"
+  mkdir -p "$BATS_TEST_TMPDIR/profile"
+  printf '{"session_id":"%s","source":"clear"}' "$new" \
+    | env -u CODEX_THREAD_ID CODEX_HOME="$BATS_TEST_TMPDIR/profile" AGMSG_AGENT_PID="$pid" \
+      bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT" >/dev/null
+  kill "$pid" 2>/dev/null || true
+  [ "$(cat "$rec_a")" = "$before_a" ]
+  [ "$(cat "$rec_b")" = "$before_b" ]
+  # The thread's profile is still published, as for any session.
+  [ -f "$TEST_SKILL_DIR/run/codex-thread-home.$new" ]
+}
+
+@test "session-start.sh for codex keeps #1607's recovery after /clear: the project's sole registration follows the new thread (#1468)" {
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  local old=11111111-1111-4111-8111-111111111111 new=22222222-2222-4222-8222-222222222222
+  local rec="$TEST_SKILL_DIR/run/role-session.team__alice"
+  SKILL_DIR="$TEST_SKILL_DIR" bash -c '
+    source "$1/lib/role-session.sh"
+    agmsg_role_session_record team alice "$2" "$3" codex
+  ' _ "$SCRIPTS" "$old" "$TEST_PROJECT"
+  mkdir -p "$BATS_TEST_TMPDIR/profile"
+  printf '{"session_id":"%s","source":"clear"}' "$new" \
+    | env -u CODEX_THREAD_ID CODEX_HOME="$BATS_TEST_TMPDIR/profile" \
+      bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT" >/dev/null
+  grep -qx "session=$new" "$rec"
+}
+
+@test "session-start.sh for codex never picks a seat by the pane its environment names, and says the conversation is unseated (#1468)" {
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" team bob codex "$TEST_PROJECT" >/dev/null
+  local old_a=11111111-1111-4111-8111-111111111111 old_b=33333333-3333-4333-8333-333333333333
+  local new=22222222-2222-4222-8222-222222222222
+  local rec_a="$TEST_SKILL_DIR/run/role-session.team__alice" rec_b="$TEST_SKILL_DIR/run/role-session.team__bob"
+  # The hook runs under the profile's shared app-server daemon, so the pane in
+  # its environment is the one that started the daemon: here, bob's, while the
+  # /clear happened in another seat. bob's placement record and naming mark
+  # both agree with that pane.
+  local sock="$BATS_TEST_TMPDIR/herdr.sock" ref epoch
+  : > "$sock"
+  SKILL_DIR="$TEST_SKILL_DIR" HERDR_ENV=1 HERDR_SOCKET_PATH="$sock" HERDR_PANE_ID=w1:p17 bash -c '
+    source "$1/lib/terminal-registry.sh"; source "$1/lib/role-session.sh"
+    here="$(agmsg_terminal_self_env)"; IFS=$'"'"'\t'"'"' read -r t id epoch <<< "$here"
+    ref="$(agmsg_terminal_ref "$t" "$id")"
+    agmsg_role_session_record team alice "$2" "$4" codex
+    agmsg_role_session_record team bob "$3" "$4" codex
+    printf "%s\t%s\tcodex\n" "$ref" "$4" > "$(agmsg_spawn_path team bob)"
+    agmsg_role_session_mark_named team bob "$ref" "$epoch" "$4" codex
+  ' _ "$SCRIPTS" "$old_a" "$old_b" "$TEST_PROJECT"
+  local before_a before_b out
+  before_a="$(cat "$rec_a")"; before_b="$(cat "$rec_b")"
+  mkdir -p "$BATS_TEST_TMPDIR/profile"
+  out="$(printf '{"session_id":"%s","source":"clear"}' "$new" \
+    | env -u CODEX_THREAD_ID CODEX_HOME="$BATS_TEST_TMPDIR/profile" \
+      HERDR_ENV=1 HERDR_SOCKET_PATH="$sock" HERDR_PANE_ID=w1:p17 \
+      bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT")"
+  [ "$(cat "$rec_a")" = "$before_a" ]
+  [ "$(cat "$rec_b")" = "$before_b" ]
+  grep -q "not connected to a seat" <<<"$out"
+  grep -q "actas" <<<"$out"
 }
 
 # #1477: Codex installed after agmsg never gets this install's writable_roots
@@ -4206,6 +4341,10 @@ _fake_herdr_with_session() {
 { printf 'herdr'; for a in "\$@"; do printf ' [%s]' "\$a"; done; printf '\n'; } >> "$ARGV_LOG"
 if [ "\$1" = agent ] && [ "\$2" = list ]; then
   printf '{"id":"1","result":{"type":"list","agents":[{"agent":"claude","agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"%s"},"pane_id":"wC:p4","display_agent":"x","name":"k"}]}}\n' "$sid"
+elif [ "\$1" = agent ] && [ "\$2" = get ]; then
+  printf '{"result":{"agent":{"pane_id":"%s","name":"k"}}}\n' "\$3"
+elif [ "\$1" = pane ] && [ "\$2" = get ]; then
+  echo '{"result":{"pane":{"terminal_id":"term_delivery"}}}'
 fi
 exit 0
 EOF

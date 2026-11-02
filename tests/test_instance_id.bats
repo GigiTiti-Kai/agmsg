@@ -455,6 +455,51 @@ gone_pid() {
   [[ "$output" == *"ignoring non-numeric AGMSG_AGENT_PID"* ]]
 }
 
+@test "override: CLAUDE_PID names the seat on Windows only, and only while alive (#1585)" {
+  unset AGMSG_AGENT_PID
+  # Synthetic pid and stubbed liveness / ancestor walk: a real $$ is an MSYS pid
+  # that tasklist would not know on Windows, and the walk must be pinned too.
+  _agmsg_pid_alive() { return 0; }
+  compat_get_ppid() { return 1; }
+  # Windows: a live CLAUDE_PID is taken without walking ps (which cannot see claude.exe).
+  _agmsg_platform=msys CLAUDE_PID=424242 run agmsg_agent_pid claude-code
+  [ "$status" -eq 0 ]
+  [ "$output" = "424242" ]
+  # Another host type, or a non-Windows host, never reads it.
+  _agmsg_platform=msys CLAUDE_PID=424242 run agmsg_agent_pid codex
+  [ "$status" -ne 0 ]
+  _agmsg_platform=linux CLAUDE_PID=424242 run agmsg_agent_pid claude-code
+  [ "$status" -ne 0 ]
+  # A dead pid is not trusted.
+  _agmsg_pid_alive() { return 1; }
+  _agmsg_platform=msys CLAUDE_PID=424242 run agmsg_agent_pid claude-code
+  [ "$status" -ne 0 ]
+}
+
+@test "override: a Windows hook without CLAUDE_PID finds the claude.exe ancestor through Windows" {
+  unset AGMSG_AGENT_PID CLAUDE_PID _AGMSG_COMPAT_NO_CIM
+  _agmsg_pid_alive() { return 0; }
+  compat_get_ppid() { return 1; }
+  _compat_get_winpid() { printf '7777'; }
+  # Records the question so the test can see which image was asked for.
+  powershell.exe() { printf '%s\n' "$*" > "$BATS_TEST_TMPDIR/ps-args"; printf '5480\r\n'; }
+  _agmsg_platform=msys run agmsg_agent_pid claude-code
+  [ "$status" -eq 0 ]
+  [ "$output" = "5480" ]
+  grep -Fq "claude.exe" "$BATS_TEST_TMPDIR/ps-args"
+  grep -Fq "7777" "$BATS_TEST_TMPDIR/ps-args"
+  # No claude.exe ancestor: the bare fallback, as before.
+  powershell.exe() { :; }
+  _agmsg_platform=msys run agmsg_agent_pid claude-code
+  [ "$status" -ne 0 ]
+  # Never asked off Windows or for another host type.
+  powershell.exe() { printf '5480'; }
+  _agmsg_platform=linux run agmsg_agent_pid claude-code
+  [ "$status" -ne 0 ]
+  _agmsg_platform=msys run agmsg_agent_pid codex
+  [ "$status" -ne 0 ]
+}
+
 # --- actas distinctness: the #93 payoff ---
 
 # Two instance ids that share a session_id prefix but differ in pid must be
@@ -728,6 +773,22 @@ require_eperm_pid() {
   run _agmsg_pid_valid 4294967295; [ "$status" -ne 0 ]
 }
 
+@test "instance-id: the DWORD ceiling also applies under UCRT64 and CLANG64 (#1752)" {
+  # Git for Windows 2.56 defaults new MSYS2 installs to MSYSTEM=UCRT64, and
+  # CLANG64 is another live MSYS2 environment -- neither is MINGW*/MSYS*, so
+  # a pattern that only names those two silently falls back to the POSIX
+  # pid_t ceiling on exactly the hosts #1752 was filed about.
+  for sys in UCRT64 CLANG64 CLANGARM64; do
+    run env MSYSTEM="$sys" bash -c \
+      'SKILL_DIR="'"$SKILL_DIR"'"; . "$SKILL_DIR/scripts/lib/instance-id.sh"
+       _agmsg_pid_valid 2147483648 || exit 1
+       _agmsg_pid_valid 4294967295 || exit 2
+       _agmsg_pid_valid 4294967296 && exit 3
+       exit 0'
+    [ "$status" -eq 0 ]
+  done
+}
+
 @test "instance-id: liveness answers alive on the builtin, before any subshell" {
   # The launcher polls liveness in loops that were deliberately made fork-free
   # (#466/#496). Routing them through a helper is only acceptable while the
@@ -766,6 +827,23 @@ require_eperm_pid() {
   # The counterpart, pinned so the split is not a distinction without a
   # difference: the same live pid reads as dead through the plain helper.
   ! MSYSTEM=MINGW64 PATH="$stub:$PATH" _agmsg_pid_alive $$
+}
+
+@test "pid_alive: UCRT64 and CLANG64 also route through tasklist, not kill -0 (#1752)" {
+  skip_on_windows "stubs tasklist; the real one is authoritative on Windows"
+  local stub="$BATS_TEST_TMPDIR/stub-bin"
+  mkdir -p "$stub"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$stub/tasklist"
+  chmod +x "$stub/tasklist"
+
+  for sys in UCRT64 CLANG64; do
+    MSYSTEM="$sys" PATH="$stub:$PATH" _agmsg_pid_alive_local $$
+    # Before #1752's fix, UCRT64/CLANG64 fell through to the plain kill -0
+    # path and read a live pid as alive here too -- which hid the bug. Pin
+    # the actual symptom: under the real tasklist stub (exit 0, no match),
+    # the tasklist-routed check reports dead.
+    ! MSYSTEM="$sys" PATH="$stub:$PATH" _agmsg_pid_alive $$
+  done
 }
 
 @test "pid_alive_local: an oversized pid is dead on Windows too" {

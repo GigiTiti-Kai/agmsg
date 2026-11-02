@@ -350,6 +350,159 @@ _wait_for_file_contains() {
   return 1
 }
 
+# Self-managed renewal (--max-seconds, added only by the Claude Code launch
+# commands): a little before the host's cap the watcher decides for itself and
+# prints one line, then exits 0. Delivered something, or AGMSG_CC_MONITOR_KEEP_ALIVE
+# set -> "re-arm" naming the command to hand back; otherwise "stopping". Without
+# the flag it never ends on its own.
+_wait_exit() {  # <pid> <tenths>
+  local i
+  for i in $(seq 1 "$2"); do
+    kill -0 "$1" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+@test "watch: --max-seconds ends the run with a re-arm line after a delivery, a stopping line when quiet, and never without the flag" {
+  local out="$BATS_TEST_TMPDIR/ms.out" pid
+  # One role per run: a watcher that names a role claims its actas lock.
+  bash "$SCRIPTS/join.sh" team carol claude-code "$PROJ" >/dev/null
+  bash "$SCRIPTS/join.sh" team dave claude-code "$PROJ" >/dev/null
+
+  bash "$SCRIPTS/send.sh" team bob alice "renewal probe" >/dev/null
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" s-ms1 "$PROJ" claude-code alice --max-seconds=8 >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  _wait_exit "$pid" 150 || { _stop_watcher "$pid"; false; }
+  wait "$pid"
+  grep -qF 'renewal probe' "$out"
+  grep -qF 'agmsg watch: re-arm' "$out"
+  grep -qF 'description: agmsg inbox stream (acting as alice) persistent: true timeout_ms: 1800000' "$out"
+  grep -qF -- 'watch.sh s-ms1' "$out"
+  grep -qF -- 'alice --max-seconds=8' "$out"
+
+  # Quiet run: nothing delivered -> stopping, not re-arm.
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" s-ms2 "$PROJ" claude-code carol --max-seconds=2 >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  _wait_exit "$pid" 150 || { _stop_watcher "$pid"; false; }
+  wait "$pid"
+  grep -qF 'agmsg watch: stopping' "$out"
+  refute grep -qF 'agmsg watch: re-arm' "$out"
+
+  # Quiet but kept alive by the environment -> re-arm anyway.
+  AGMSG_CC_MONITOR_KEEP_ALIVE=1 AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" s-ms3 "$PROJ" claude-code dave --max-seconds=2 >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  _wait_exit "$pid" 150 || { _stop_watcher "$pid"; false; }
+  wait "$pid"
+  grep -qF 'agmsg watch: re-arm' "$out"
+
+  # No flag: it keeps running well past the same window.
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" s-ms4 "$PROJ" claude-code bob >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  if _wait_exit "$pid" 40; then
+    echo "watch.sh ended on its own without --max-seconds" >&2
+    false
+  fi
+  _stop_watcher "$pid"
+  refute grep -qF 'agmsg watch:' "$out"
+
+  # #1XXX: once this seat's own role-session record shows agmsgd has taken
+  # over delivery (the same record/health reads actas-claim.sh and daemon.sh
+  # status use, see test_session_start_claude_code_native_channel.bats), the
+  # renewal loop must stop rather than re-arm -- even though this run DID
+  # deliver a message, which on its own would otherwise mean re-arm (see the
+  # first case above).
+  bash "$SCRIPTS/join.sh" team erin claude-code "$PROJ" >/dev/null
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" < "$SCRIPTS/daemon/schema.sql"
+  local boot
+  case "$(uname -s)" in
+    Darwin) boot="$(sysctl -n kern.bootsessionuuid)" ;;
+    Linux) boot="$(sed -n 's/^btime //p' /proc/stat)" ;;
+    *) skip 'POSIX beta executor evidence' ;;
+  esac
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE meta SET node_path='$(command -v node)'; UPDATE daemon_intent SET desired='on';
+    UPDATE daemon_owner SET state='ready', executor_pid=$$, executor_boot_id='$boot', executor_started_at=strftime('%Y-%m-%dT%H:%M:%fZ','now');"
+  AGMSG_AGENT_PID=$$ CLAUDE_CODE_MESSAGING_SOCKET="uds:/tmp/cc-socks/s-ms-native.sock" \
+    bash "$SCRIPTS/actas-claim.sh" "$PROJ" claude-code erin "s-ms-native" | grep -qx "delivery=native"
+
+  # Historical transcript-held hints do not keep a redundant watch alive.
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" <<'SQL'
+CREATE TABLE beta_claude_seat (seat TEXT PRIMARY KEY, messaging_socket TEXT, state TEXT NOT NULL, reason TEXT NOT NULL, checked_at TEXT NOT NULL);
+INSERT INTO beta_claude_seat VALUES ('["team","erin"]', '/tmp/cc-socks/s-ms-native.sock', 'blocked', 'peer_held: historical hint', '2026-10-23');
+SQL
+  bash "$SCRIPTS/send.sh" team bob erin "native-delivered probe" >/dev/null
+  AGMSG_AGENT_PID=$$ AGMSG_WATCH_INTERVAL=1 \
+    bash "$SCRIPTS/watch.sh" s-ms-native "$PROJ" claude-code erin --max-seconds=2 >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  _wait_exit "$pid" 150 || { _stop_watcher "$pid"; false; }
+  wait "$pid"
+  grep -qF 'native-delivered probe' "$out"
+  grep -qF 'agmsg watch: stopping' "$out"
+  refute grep -qF 'agmsg watch: re-arm' "$out"
+
+  # #1633 review: `daemon disable` flips daemon_intent.desired to off
+  # before the still-running owner finishes shutting down, so HEALTH can read
+  # `ready` for a window after DESIRED already reads `off`. The queue this
+  # seat would otherwise rely on refuses to enqueue once desired != on, so the
+  # watcher must NOT treat that window as native-delivered -- it has to keep
+  # re-arming, same as a seat that never went native at all.
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_intent SET desired='off';"
+  bash "$SCRIPTS/send.sh" team bob erin "disable-window probe" >/dev/null
+  AGMSG_AGENT_PID=$$ AGMSG_WATCH_INTERVAL=1 \
+    bash "$SCRIPTS/watch.sh" s-ms-native "$PROJ" claude-code erin --max-seconds=2 >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  _wait_exit "$pid" 150 || { _stop_watcher "$pid"; false; }
+  wait "$pid"
+  grep -qF 'disable-window probe' "$out"
+  grep -qF 'agmsg watch: re-arm' "$out"
+
+  # Follow-up to the #1633 review: messaging_socket alone proves the
+  # record EXISTS, not that the daemon would treat it as addressable --
+  # claude-code-queue.mjs also demands type=claude-code,
+  # and a project match before it will ever enqueue. Simulate a stale record left behind by this exact (team, agent)
+  # pair once having been claimed from a DIFFERENT project (the daemon's own
+  # role_session_project_mismatch) by corrupting just the project= line; the
+  # socket/session/type fields are all still genuinely this seat's own.
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_intent SET desired='on';"
+  local rs_file
+  rs_file="$(ls "$TEST_SKILL_DIR"/run/role-session.*erin 2>/dev/null | head -1)"
+  [ -n "$rs_file" ]
+  sed -i.bak 's#^project=.*#project=/tmp/agmsg-some-other-project#' "$rs_file"
+  bash "$SCRIPTS/send.sh" team bob erin "project-mismatch probe" >/dev/null
+  AGMSG_AGENT_PID=$$ AGMSG_WATCH_INTERVAL=1 \
+    bash "$SCRIPTS/watch.sh" s-ms-native "$PROJ" claude-code erin --max-seconds=2 >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  _wait_exit "$pid" 150 || { _stop_watcher "$pid"; false; }
+  wait "$pid"
+  grep -qF 'project-mismatch probe' "$out" || { cat "$out"; false; }
+  grep -qF 'agmsg watch: re-arm' "$out"
+
+  # Review round 2: being looked up BY (team, agent) only proves the
+  # FILENAME encodes this pair, not that the record's own team=/agent=
+  # CONTENT fields agree with it -- the daemon's reader checks those
+  # separately (role_session_identity_mismatch) and the shell getters enforce
+  # nothing on their own. Restore the project= line this test corrupted above,
+  # then corrupt only agent= to a different seat name.
+  mv -f "$rs_file.bak" "$rs_file"
+  sed -i.bak 's#^agent=.*#agent=some-other-seat#' "$rs_file"
+  bash "$SCRIPTS/send.sh" team bob erin "identity-mismatch probe" >/dev/null
+  AGMSG_AGENT_PID=$$ AGMSG_WATCH_INTERVAL=1 \
+    bash "$SCRIPTS/watch.sh" s-ms-native "$PROJ" claude-code erin --max-seconds=2 >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  _wait_exit "$pid" 150 || { _stop_watcher "$pid"; false; }
+  wait "$pid"
+  grep -qF 'identity-mismatch probe' "$out"
+  grep -qF 'agmsg watch: re-arm' "$out"
+}
+
 @test "watch: restart delivers messages that arrived while the watcher was down" {
   skip_on_windows "watcher background launch under Git Bash (#182)"
   local sid="sess-restart"

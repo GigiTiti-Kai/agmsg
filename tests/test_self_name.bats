@@ -18,7 +18,7 @@
 #   - order independence: a boot path first, then the action; the action
 #     first, then a boot path -- same key, one terminal call in total
 #   - herdr identifies its pane from HERDR_PANE_ID with no session id
-#   - the action commands (send / inbox / history) run the hook, and a failure
+#   - the action commands (send / inbox) run the hook, and a failure
 #     to name never fails the command
 
 setup() {
@@ -113,6 +113,9 @@ _install_fake_herdr() {
 state='$FAKE_HERDR_STATE'
 if [ "\$1" = agent ] && [ "\$2" = list ]; then
   printf '{"id":"1","result":{"type":"list","agents":[]}}\n'
+elif [ "\$1" = agent ] && [ "\$2" = get ]; then
+  # This fixture exercises naming marks with an initially unnamed agent.
+  printf '{"result":{"agent":{"pane_id":"%s"}}}\n' "\$3"
 elif [ "\$1" = pane ] && [ "\$2" = rename ]; then
   grep -v "^\$3	" "\$state" > "\$state.n" 2>/dev/null || : > "\$state.n"
   printf '%s\t%s\n' "\$3" "\$4" >> "\$state.n"; mv "\$state.n" "\$state"
@@ -293,6 +296,74 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
   # alice keeps everything.
   [ "$(_mark team alice)" = $'tmux:/tmp/s:%3\tpid=4242' ]
   [ "$(_placement team alice)" = 'tmux:/tmp/s:%3' ]
+
+  # An actas is different: the session is declaring that it now acts as bob, and
+  # alice was the name it acted as in this very pane a moment ago. Her record
+  # would otherwise refuse bob forever, so the claim retires it -- but only the
+  # records that point at THIS pane and belong to no other live session.
+  #   - alice in another team has a record for another pane: untouched
+  #   - a seat that another session holds, in another pane: its record stays and
+  #     it still refuses whoever acts from that pane
+  #   - a seat held by ANOTHER PROCESS OF THE SAME SESSION ID (the lock owner is
+  #     "<sid>.<pid>", and only the whole thing says whose it is): kept
+  #   - a record of ANOTHER TEAM that points at the same pane and has no lock:
+  #     kept, so the name acting from there is still refused
+  _join_unnamed team bob
+  _join_unnamed team2 alice
+  _join_unnamed team eve
+  _join_unnamed team frank
+  source "$SKILL_DIR/scripts/lib/actas-lock.sh"
+  agmsg_write_atomic "$(agmsg_spawn_path team2 alice)" "$(printf 'tmux:/tmp/s:%%9\t/tmp/p\tclaude-code')"
+  agmsg_write_atomic "$(agmsg_spawn_path team eve)" "$(printf 'tmux:/tmp/s:%%5\t/tmp/p\tclaude-code')"
+  printf 'other-session.99999\n' > "$(actas_lock_path team eve)"
+
+  run bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p claude-code bob sid-bob
+  [ "$status" -eq 0 ]
+  grep -q 'status=ok' <<<"$output"
+  [ "$(_placement team bob)" = 'tmux:/tmp/s:%3' ]       # bob is named and recorded here now
+  [ -z "$(_placement team alice)" ]                     # alice's record for this pane is gone
+  [ -z "$(_mark team alice)" ]                          # and so is the mark that said she was named here
+  [ "$(_placement team2 alice)" = 'tmux:/tmp/s:%9' ]    # her other placement stays
+
+  _under_tmux /tmp/s 4242 %5
+  run bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p claude-code frank sid-frank
+  grep -q 'already recorded as' <<<"$output"            # held by another session: still a rival
+  [ -z "$(_placement team frank)" ]
+  [ "$(_placement team eve)" = 'tmux:/tmp/s:%5' ]
+
+  # Same bare session id, another live process: the lock owner differs only in
+  # its pid, and that is enough for the seat to stay.
+  _join_unnamed team gina
+  _join_unnamed team hank
+  agmsg_write_atomic "$(agmsg_spawn_path team gina)" "$(printf 'tmux:/tmp/s:%%6\t/tmp/p\tclaude-code')"
+  printf 'sid-hank.12345\n' > "$(actas_lock_path team gina)"
+  _under_tmux /tmp/s 4242 %6
+  run bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p claude-code hank sid-hank
+  grep -q 'already recorded as' <<<"$output"
+  [ -z "$(_placement team hank)" ]
+  [ "$(_placement team gina)" = 'tmux:/tmp/s:%6' ]
+
+  # A record of another team for the same pane, no lock: not this team's, so not
+  # retired, and it still refuses.
+  _join_unnamed team jack
+  _join_unnamed team2 iris
+  agmsg_write_atomic "$(agmsg_spawn_path team2 iris)" "$(printf 'tmux:/tmp/s:%%7\t/tmp/p\tclaude-code')"
+  _under_tmux /tmp/s 4242 %7
+  run bash "$SKILL_DIR/scripts/actas-claim.sh" /tmp/p claude-code jack sid-jack
+  grep -q 'already recorded as' <<<"$output"
+  [ -z "$(_placement team jack)" ]
+  [ "$(_placement team2 iris)" = 'tmux:/tmp/s:%7' ]
+
+  # Owner and instance both BARE: equal, and so no proof of whose the lock is.
+  _join_unnamed team lena
+  _join_unnamed team mark
+  agmsg_write_atomic "$(agmsg_spawn_path team lena)" "$(printf 'tmux:/tmp/s:%%8\t/tmp/p\tclaude-code')"
+  printf 'shared\n' > "$(actas_lock_path team lena)"
+  _under_tmux /tmp/s 4242 %8
+  run agmsg_terminal_name_self_safe shared team mark /tmp/p claude-code record retire_previous shared
+  grep -q 'already recorded as' <<<"$output"
+  [ -z "$(_placement team mark)" ]
+  [ "$(_placement team lena)" = 'tmux:/tmp/s:%8' ]
 }
 
 # --- order independence with the existing paths -------------------------------------
@@ -528,13 +599,12 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
   [ "$status" -eq 0 ]
   grep -q '\[@agmsg_agent\] \[team:alice\]' "$ARGV_LOG"
   [ "$(_mark team alice)" = $'tmux:/tmp/s:%3\tpid=4242' ]
-  # Order independence end to end: a boot path (join, kept as it was: it
-  # names unconditionally) writes the SAME key, and the send after it finds
-  # the mark and makes no call of its own.
+  # Re-registering does not adopt the identity or name the caller. The mark
+  # from the first send remains valid, so the next send needs no naming call.
   : > "$ARGV_LOG"
   bash "$SKILL_DIR/scripts/join.sh" team alice claude-code /tmp/p >/dev/null
-  [ "$(_name_calls)" -eq 1 ]
-  grep -q '\[-t\] \[%3\] \[@agmsg_agent\] \[team:alice\]' "$ARGV_LOG"
+  [ "$(_name_calls)" -eq 0 ]
+  refute grep -q '\[@agmsg_agent\]' "$ARGV_LOG"
   : > "$ARGV_LOG"
   run bash "$SKILL_DIR/scripts/send.sh" team alice bob 'hello twice'
   [ "$status" -eq 0 ]
@@ -546,7 +616,7 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
   [ "$status" -eq 0 ]
 }
 
-@test "inbox.sh and history.sh (with an agent) name the reader's pane; history without an agent does not" {
+@test "inbox.sh names the reader's pane; history.sh never does, with or without an agent" {
   _install_fake_tmux; _under_tmux /tmp/s 4242 %3
   _join_unnamed team alice
   : > "$ARGV_LOG"
@@ -556,9 +626,29 @@ _placement() {   # <team> <agent> -> "<terminal>:<id>" or empty
   : > "$ARGV_LOG"
   _under_tmux /tmp/s 4242 %4
   bash "$SKILL_DIR/scripts/history.sh" team alice 5 >/dev/null 2>&1 || true
-  grep -q '\[-t\] \[%4\] \[@agmsg_agent\] \[team:alice\]' "$ARGV_LOG"
+  [ "$(_terminal_calls)" -eq 0 ]
   : > "$ARGV_LOG"
   bash "$SKILL_DIR/scripts/history.sh" team >/dev/null 2>&1 || true
+  [ "$(_terminal_calls)" -eq 0 ]
+}
+
+# #1756: history's <agent> is a filter. Reading another seat's history from a
+# different pane used to rewrite that seat's pane record to the reader's pane.
+@test "history.sh <team> <other-agent> from another pane leaves the other seat's records alone" {
+  _install_fake_tmux; _under_tmux /tmp/s 4242 %3
+  _join_unnamed team alice
+  _join_unnamed team bob
+  bash "$SKILL_DIR/scripts/inbox.sh" team alice >/dev/null 2>&1 || true
+  [ "$(_placement team alice)" = 'tmux:/tmp/s:%3' ]
+  before_mark="$(_mark team alice)"
+  [ -n "$before_mark" ]
+  : > "$ARGV_LOG"
+  _under_tmux /tmp/s 4242 %7
+  run bash "$SKILL_DIR/scripts/history.sh" team alice 5
+  [ "$status" -eq 0 ]
+  [ "$(_placement team alice)" = 'tmux:/tmp/s:%3' ]
+  [ "$(_mark team alice)" = "$before_mark" ]
+  [ -z "$(_placement team bob)" ]
   [ "$(_terminal_calls)" -eq 0 ]
 }
 
