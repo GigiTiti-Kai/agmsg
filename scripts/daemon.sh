@@ -25,6 +25,8 @@ source "$SCRIPT_DIR/lib/daemon-seats.sh"
 source "$SCRIPT_DIR/lib/install-db.sh"
 # shellcheck source=lib/sqlpath.sh
 source "$SCRIPT_DIR/lib/sqlpath.sh"
+# shellcheck source=lib/node.sh
+source "$SCRIPT_DIR/lib/node.sh"
 # shellcheck source=lib/hash.sh
 source "$SCRIPT_DIR/lib/hash.sh"
 
@@ -326,13 +328,35 @@ _systemd_user_usable() { "$AGMSGD_SYSTEMCTL" --user show-environment >/dev/null 
 
 _systemd_unit_path() { printf '%s/.config/systemd/user/agmsgd-%s.service' "$HOME" "$(_unit_id)"; }
 
+# The PATH a systemd --user service gets: the directories holding sqlite3 and
+# the recorded Node, then systemd's own default. systemd --user starts units
+# with a minimal PATH (no ~/.local/bin, no version-manager shims), and the
+# launcher needs sqlite3 before it can read anything. Directories that cannot
+# be written into a quoted unit line (a quote, backslash or control character)
+# are left out. $1 is the Node enable resolved.
+_systemd_unit_path_dirs() {
+  local node_path="$1" dir out="" tool
+  for tool in "$(command -v sqlite3 2>/dev/null || true)" "$node_path"; do
+    case "$tool" in */*) dir="${tool%/*}" ;; *) continue ;; esac
+    [ -n "$dir" ] || dir=/
+    case "$dir" in /*) ;; *) continue ;; esac
+    case "$dir" in *[\\\"[:cntrl:]]*) continue ;; esac
+    case ":$out:" in *":$dir:"*) continue ;; esac
+    out="${out:+$out:}$dir"
+  done
+  printf '%s' "${out:+$out:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+}
+
 # NOT YET RUN ON LINUX in this environment -- configured with
 # (Restart=on-failure, RestartSec=30s, StartLimitIntervalSec=600,
 # StartLimitBurst=5) and shellchecked only.
 _register_linux() {
-  local unit_path unit_name
+  local node_path="$1" unit_path unit_name unit_env
   unit_path="$(_systemd_unit_path)"
   unit_name="$(basename "$unit_path")"
+  # systemd expands %-specifiers in Environment= values.
+  unit_env="$(_systemd_unit_path_dirs "$node_path")"
+  unit_env="${unit_env//%/%%}"
   mkdir -p "$(dirname "$unit_path")"
   cat > "$unit_path" <<EOF
 [Unit]
@@ -342,6 +366,7 @@ StartLimitBurst=5
 
 [Service]
 ExecStart=$LAUNCHER
+Environment="PATH=$unit_env"
 Restart=on-failure
 RestartSec=30s
 
@@ -557,15 +582,42 @@ _unregister() {
 # Confirms Node by actually running it, the same check
 # agmsgd-launch.sh itself does -- enable/start both need this before
 # recording node_path/node_version.
-_resolve_node() {
-  local candidate="${1:-node}" resolved
-  resolved="$(command -v "$candidate" 2>/dev/null)" || return 1
+_node_usable() {
+  local resolved="$1"
+  [ -n "$resolved" ] && [ -x "$resolved" ] || return 1
   "$resolved" --disable-warning=ExperimentalWarning -e '
     const [maj, min] = process.versions.node.split(".").map(Number);
     if (maj < 22 || (maj === 22 && min < 13)) process.exit(1);
     require("node:sqlite");
   ' 2>/dev/null || return 1
-  printf '%s' "$resolved"
+}
+
+# Prints the first Node that passes _node_usable. Candidates, in order:
+# the node_path recorded in install.db, AGMSG_NODE, then what
+# agmsg_resolve_node finds (PATH, then version-manager and system
+# locations). A shell whose PATH starts with an older Node still reaches the
+# Node agmsgd was enabled with. `fresh-first` puts the recorded path last, for
+# enable, which must record the Node it is run with rather than the old one.
+_resolve_node() {
+  local order="${1:-recorded-first}" recorded="" fresh candidate
+  recorded="$(agmsg_sqlite "$INSTALL_DB" "SELECT node_path FROM meta;" 2>/dev/null || true)"
+  recorded="${recorded%$'\r'}"
+  fresh="$(agmsg_resolve_node 2>/dev/null || true)"
+  if [ "$order" = fresh-first ]; then
+    set -- "${AGMSG_NODE:-}" "$fresh" "$recorded"
+  else
+    set -- "$recorded" "${AGMSG_NODE:-}" "$fresh"
+  fi
+  for candidate in "$@"; do
+    [ -n "$candidate" ] || continue
+    # A bare name (agmsg_resolve_node's last resort) is looked up on PATH.
+    case "$candidate" in */*) ;; *) candidate="$(command -v "$candidate" 2>/dev/null)" || continue ;; esac
+    if _node_usable "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
 }
 
 _resolve_codex() {
@@ -638,7 +690,9 @@ cmd_start() {
   _ensure_install_db_schema
   local state
   state="$(agmsg_sqlite "$INSTALL_DB" "SELECT state FROM daemon_owner;")"
-  if [ "$state" = "ready" ] && node "$SCRIPT_DIR/daemon/status.mjs" "$SKILL_DIR" >/dev/null 2>&1; then
+  local running_node
+  running_node="$(_resolve_node 2>/dev/null || true)"
+  if [ "$state" = "ready" ] && [ -n "$running_node" ] && "$running_node" "$SCRIPT_DIR/daemon/status.mjs" "$SKILL_DIR" >/dev/null 2>&1; then
     echo "agmsg daemon start: already running"
     agmsg_daemon_seat_report start
     _path_hint status
@@ -651,8 +705,8 @@ cmd_start() {
   # intent when there is none.
   local recorded_node found_node found_version record_node_sql=""
   recorded_node="$(agmsg_sqlite "$INSTALL_DB" "SELECT node_path FROM meta;" 2>/dev/null || true)"
-  if [ -z "$recorded_node" ] || [ ! -x "$recorded_node" ]; then
-    found_node="$(_resolve_node node)" || {
+  if ! _node_usable "$recorded_node"; then
+    found_node="$(_resolve_node)" || {
       echo "agmsg daemon start: no usable Node found (need >= 22.13.0 with node:sqlite), so agmsgd cannot start. Nothing was changed. Install Node from https://nodejs.org/en/download, then run agmsg daemon start." >&2
       _path_hint start >&2
       return 1
@@ -727,7 +781,10 @@ cmd_start() {
 _request_stop_over_socket() {
   local socket="$1"
   [ -n "$socket" ] || return 0
-  node -e '
+  local stop_node
+  stop_node="$(_resolve_node 2>/dev/null || true)"
+  [ -n "$stop_node" ] || return 0
+  "$stop_node" -e '
     const net = require("node:net");
     const s = net.createConnection(process.argv[1]);
     const done = () => { try { s.destroy(); } catch {} process.exit(0); };
@@ -785,7 +842,7 @@ cmd_status() {
     return 0
   fi
   local node_path
-  node_path="$(_resolve_node node 2>/dev/null || true)"
+  node_path="$(_resolve_node 2>/dev/null || true)"
   if [ -n "$node_path" ]; then
     local status_rc=0
     if [ "$json" = true ]; then
@@ -824,6 +881,33 @@ cmd_status() {
   return "$health_rc"
 }
 
+# Is any Codex seat registered? Only then does a missing Codex executable
+# matter. An unreadable inventory counts as yes, so the warning is not lost.
+_has_codex_seat() {
+  local cfg cfg_sql n
+  for cfg in "$SKILL_DIR/teams/"*/config.json; do
+    [ -f "$cfg" ] || continue
+    cfg_sql="$(agmsg_sql_readfile_path "$cfg")"
+    n="$(sqlite3 :memory: "SELECT count(*) FROM json_each(CAST(readfile('$cfg_sql') AS TEXT),'\$.agents') a, json_each(a.value,'\$.registrations') r WHERE json_extract(r.value,'\$.type')='codex';" 2>/dev/null)" || return 0
+    [ "${n%$'\r'}" = 0 ] || return 0
+  done
+  return 1
+}
+
+# Keeps ~/.agents/bin/codex in step with who delivers Codex notices (see
+# codex-shim-install.sh sync): not needed while agmsgd delivers, put back when
+# it stops. Reports what it did; a failure is shown and never fails the command.
+_codex_shim_sync() {
+  local installer="$SCRIPT_DIR/drivers/types/codex/codex-shim-install.sh" out
+  [ -f "$installer" ] || return 0
+  if out="$(bash "$installer" sync 2>&1)"; then
+    case "$out" in removed:*|installed:*) printf 'agmsg daemon: %s\n' "$out" ;; esac
+  else
+    printf 'agmsg daemon: could not update the Codex shim: %s\n' "$out" >&2
+  fi
+  return 0
+}
+
 cmd_enable() {
   _ensure_install_db_schema
   if [ "$(_os)" = linux ] && ! _systemd_user_usable; then
@@ -832,7 +916,7 @@ cmd_enable() {
     return 1
   fi
   local node_path
-  node_path="$(_resolve_node node)" || {
+  node_path="$(_resolve_node fresh-first)" || {
     echo "agmsg daemon enable: no usable Node found (need >= 22.13.0 with node:sqlite). Install one and try again." >&2
     echo 'Install Node from https://nodejs.org/en/download, then run agmsg daemon enable.' >&2
     _path_hint enable >&2
@@ -842,7 +926,7 @@ cmd_enable() {
   node_version="$("$node_path" -e 'console.log(process.versions.node)')"
   local codex_path
   codex_path="$(_resolve_codex 2>/dev/null || true)"
-  if [ -z "$codex_path" ]; then
+  if [ -z "$codex_path" ] && _has_codex_seat; then
     echo 'agmsg daemon enable: no usable Codex executable found; Codex seats stay blocked until enabled again with Codex available.' >&2
   fi
   # Whether a unit was already registered decides what a failure may undo: a
@@ -866,6 +950,7 @@ cmd_enable() {
     fi
     return 1
   }
+  _codex_shim_sync
   cmd_start
 }
 
@@ -973,6 +1058,7 @@ cmd_disable() {
     echo "agmsg daemon disable: service was unregistered but agmsgd has not confirmed stopping -- check 'agmsg daemon status'" >&2
     return 1
   fi
+  _codex_shim_sync
   echo 'agmsg daemon disable: agmsgd turned off. Existing bridges continue to deliver notices; new Codex launches get a bridge.'
   echo 'Codex sessions without a bridge must be restarted. Until then they receive no new notices; unread messages are preserved. Restart with codex resume, then enter $agmsg actas <name> in that Codex session.'
   echo 'Notices already accepted by the Codex queue are not cancelled and may appear once more.'
@@ -1010,7 +1096,7 @@ cmd_offer() {
     echo "agmsgd=unavailable reason=systemd user services are not available here, so agmsgd cannot start on its own"
     return 0
   fi
-  node_path="$(_resolve_node node)" || {
+  node_path="$(_resolve_node)" || {
     echo "agmsgd=unavailable reason=agmsgd needs Node 22.13 or newer with node:sqlite, and none was found"
     return 0
   }

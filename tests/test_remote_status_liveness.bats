@@ -23,13 +23,58 @@ setup() {
   ENGINE_PIDS=""
 }
 
+# Stops <pid> only when its argv still names this test's own directory, so a pid
+# that was recycled to somebody else's process is left alone. Every path that
+# stops an engine goes through here. -ww keeps a long path from being cut short.
+_stop_owned_engine() {   # <pid>
+  local pid="$1"
+  case "$pid" in ""|*[!0-9]*) return 0 ;; esac
+  case "$(ps -ww -o args= -p "$pid" 2>/dev/null || true)" in
+    *"$TEST_SKILL_DIR/"*)
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      ;;
+  esac
+}
+
 teardown() {
-  local pid
-  for pid in $ENGINE_PIDS; do
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+  local pid pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid" seen=" "
+  # An engine `sync start` detached is not a child of this shell, so a test that
+  # forgot remember_engine_pid would leave it running for days. Its pidfile names
+  # it, as do the pids the tests registered; each one is stopped once.
+  pid=""
+  [ ! -r "$pidfile" ] || pid="$(cat "$pidfile" 2>/dev/null || true)"
+  for pid in $pid $ENGINE_PIDS; do
+    case "$seen" in *" $pid "*) continue ;; esac
+    seen="$seen$pid "
+    _stop_owned_engine "$pid"
   done
   teardown_test_env
+}
+
+@test "teardown helper: leaves a pid whose argv is not this test's engine alone" {
+  sleep 30 3>&- &
+  local foreign=$! real_teardown_env
+  printf '%s\n' "$foreign" > "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  ENGINE_PIDS="$foreign"
+  # Run the real teardown with both inputs naming the foreign pid, minus the
+  # directory removal (restored right after, for this test's own teardown).
+  real_teardown_env="$(declare -f teardown_test_env)"
+  teardown_test_env() { :; }
+  teardown
+  eval "$real_teardown_env"
+  kill -0 "$foreign"
+  kill "$foreign"
+  wait "$foreign" 2>/dev/null || true
+  ENGINE_PIDS=""
+}
+
+@test "teardown helper: stops an engine whose argv names this test's directory" {
+  start_matching_engine
+  kill -0 "$ENGINE_PID"
+  _stop_owned_engine "$ENGINE_PID"
+  run kill -0 "$ENGINE_PID"
+  [ "$status" -ne 0 ]
 }
 
 start_matching_engine() {
@@ -328,7 +373,7 @@ write_windows_spelling_fixtures() {
 }
 
 @test "status: rejects a live foreign process behind a recycled pidfile" {
-  sleep 30 &
+  sleep 30 3>&- &
   local foreign_pid=$!
   ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$foreign_pid"
   printf '%s\n' "$foreign_pid" > "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
@@ -418,7 +463,7 @@ write_windows_spelling_fixtures() {
   local fake_node fake_bin foreign_pid stamp
   stamp="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
   fake_node="$(write_fake_node)"
-  sleep 30 &
+  sleep 30 3>&- &
   foreign_pid=$!
   fake_bin="$(write_fake_node_ps_fixture "$fake_node" "$foreign_pid")"
   ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$foreign_pid"
@@ -517,7 +562,7 @@ write_windows_spelling_fixtures() {
 @test "sync start: replaces stale ownership without signalling a foreign process" {
   local fake_node fake_bin foreign_pid
   fake_node="$(write_fake_node)"
-  sleep 30 &
+  sleep 30 3>&- &
   foreign_pid=$!
   fake_bin="$(write_fake_node_ps_fixture "$fake_node" "$foreign_pid")"
   ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$foreign_pid"
@@ -535,7 +580,7 @@ write_windows_spelling_fixtures() {
 }
 
 @test "disconnect removes stale ownership without signalling a foreign process" {
-  sleep 30 &
+  sleep 30 3>&- &
   local foreign_pid=$!
   ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$foreign_pid"
   printf '%s\n' "$foreign_pid" > "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
@@ -727,6 +772,10 @@ write_windows_spelling_fixtures() {
     AGMSG_TEST_LOG_READY_FILE="$ready_file" \
     AGMSG_TEST_SYNC_START_READY_CEILING=0 \
     bash "$SCRIPTS/remote.sh" sync start testteam
+  # Registered before any assertion, so a failure here still stops the engine
+  # it started: it is detached (parent pid 1) and its sleep loop would
+  # otherwise run on after the test.
+  remember_engine_pid
   [ "$status" -eq 0 ]
   refute grep -qF "did not become ready" <<<"$output"
 }
@@ -859,7 +908,7 @@ write_unownable_ps_fixture() {
   printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/tasklist"
   chmod +x "$fake_bin/tasklist"
 
-  sleep 30 &
+  sleep 30 3>&- &
   local minted=$!
 
   # The premise, checked rather than assumed: the process really is alive.
@@ -993,7 +1042,7 @@ legacy_skip_systemd_probe_name() {
 }
 
 @test "sync start: refuses an active systemd unit with unverified identity (#894)" {
-  sleep 30 &
+  sleep 30 3>&- &
   local foreign_pid=$!
   ENGINE_PIDS="$ENGINE_PIDS $foreign_pid"
   local fake_bin fake_systemctl
@@ -1018,4 +1067,53 @@ legacy_skip_systemd_probe_name() {
   [ "$status" -eq 0 ]
   printf '%s\n' "$output" | grep -q -F -- "engine inactive under systemd"
   printf '%s\n' "$output" | grep -q -F -- "systemctl --user restart agmsg-remote-sync-testteam.service"
+}
+
+# A narrow COLUMNS must not truncate the argv we authenticate the engine by.
+#
+# Claude Code exports the terminal width as COLUMNS into every hook, and
+# procps-ng `ps -o args=` cuts its output to that width even into a pipe. The
+# cut argv no longer named the engine script nor ended with ` run --team
+# <team>`, so a healthy systemd engine read as `unknown` and `sync start`
+# refused with rc=1. These use the REAL ps -- a ps fixture would answer in
+# full whatever flags it was given and hide exactly this.
+narrow_columns_precondition() {
+  # Without the fix this width really does cut this engine's argv; if it ever
+  # stops doing so the tests below prove nothing, so say that instead.
+  local full narrow
+  full="$(ps -ww -o args= -p "$ENGINE_PID")"
+  narrow="$(COLUMNS=40 ps -o args= -p "$ENGINE_PID")"
+  [ "${#full}" -gt 40 ] && [ "$narrow" != "$full" ]
+}
+
+@test "compat_get_cmdline returns the full argv under a narrow COLUMNS" {
+  start_matching_engine
+  narrow_columns_precondition || skip "ps here does not truncate args to COLUMNS"
+  run env COLUMNS=40 bash -c '. "$1/lib/compat.sh"; compat_get_cmdline "$2"' _ "$SCRIPTS" "$ENGINE_PID"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"$SCRIPTS/internal/remote-sync.mjs run --team testteam" ]]
+}
+
+@test "status: a narrow COLUMNS does not turn a systemd engine into unknown" {
+  start_matching_engine
+  narrow_columns_precondition || skip "ps here does not truncate args to COLUMNS"
+  rm -f "$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  local fake_systemctl
+  fake_systemctl="$(write_systemd_show_fixture active "$ENGINE_PID")"
+
+  run env COLUMNS=40 AGMSG_SYSTEMCTL="$fake_systemctl" bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "connected (engine running, pid $ENGINE_PID)"
+
+  run env COLUMNS=40 AGMSG_SYSTEMCTL="$fake_systemctl" bash "$SCRIPTS/remote.sh" sync start testteam
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "already running (pid $ENGINE_PID)"
+}
+
+@test "status: a narrow COLUMNS does not turn a pidfile engine into stale" {
+  start_matching_engine
+  narrow_columns_precondition || skip "ps here does not truncate args to COLUMNS"
+  run env COLUMNS=40 bash "$SCRIPTS/remote.sh" status testteam
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"connected (engine running, pid $ENGINE_PID)"* ]]
 }
