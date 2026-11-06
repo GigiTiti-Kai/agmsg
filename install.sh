@@ -577,12 +577,24 @@ agmsg_install_optional_codex_chmod() {
   chmod +x "$SKILL_DIR/scripts/drivers/types/codex/"*.sh 2>/dev/null || true
 }
 
-agmsg_install_refresh_codex_shim() {
-  AGMSG_CODEX_SHIM_REFRESHED=false
-  if env AGMSG_CODEX_SHIM_INSTALL_QUIET=1 AGMSG_CODEX_SHIM_FORCE="${CODEX_SHIM_FORCE:-}" \
-      "$CODEX_SHIM" install >/dev/null; then
-    AGMSG_CODEX_SHIM_REFRESHED=true
+# Runs `codex-shim-install.sh sync` and shows what it did. A shim that was
+# removed or put back is reported; a failure is shown with the command that
+# repeats it, and never fails the install.
+agmsg_install_sync_codex_shim() {
+  local out
+  [ -x "$CODEX_SHIM" ] || return 0
+  if out="$(AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" sync 2>&1)"; then
+    case "$out" in removed:*|installed:*) echo "  ~ Codex shim: $out" ;; esac
+  else
+    echo "  ! could not update the Codex shim: $out" >&2
+    echo "    repeat with: $CODEX_SHIM sync" >&2
   fi
+  return 0
+}
+
+agmsg_install_refresh_codex_shim() {
+  env AGMSG_CODEX_SHIM_INSTALL_QUIET=1 AGMSG_CODEX_SHIM_FORCE="${CODEX_SHIM_FORCE:-}" \
+      "$CODEX_SHIM" install >/dev/null
   return 0
 }
 
@@ -787,37 +799,30 @@ install_antigravity_tui_shim() {
   owner="# agmsg-shim-owner: $source"
   expected_owner=""
   agmsg_install_op_require || return 1
-  mkdir -p "$target_dir"
+  mkdir -p "$target_dir" 2>/dev/null || return 2
   agmsg_install_op_require || return 1
   if [ -e "$target" ] || [ -L "$target" ]; then
     expected_owner="$(grep '^# agmsg-shim-owner: ' "$target" 2>/dev/null || true)"
     if ! grep -q '^# agmsg Antigravity TUI launcher shim$' "$target" 2>/dev/null; then
-      echo "  ~ left existing ~/.agents/bin/agy-tui untouched"
       return 0
     fi
     if [ "$expected_owner" != "$owner" ]; then
-      echo "  ~ left ~/.agents/bin/agy-tui owned by a different or legacy install untouched"
       return 0
     fi
   fi
   printf -v quoted_source '%q' "$source"
-  tmp="$(mktemp "$target_dir/.agy-tui.XXXXXX")"
+  tmp="$(mktemp "$target_dir/.agy-tui.XXXXXX" 2>/dev/null)" || return 2
   {
     printf '%s\n' '#!/usr/bin/env bash'
     printf '%s\n' 'set -euo pipefail'
     printf '%s\n' '# agmsg Antigravity TUI launcher shim'
     printf '%s\n' "$owner"
     printf 'exec bash %s "$@"\n' "$quoted_source"
-  } > "$tmp"
-  chmod +x "$tmp"
+  } 2>/dev/null > "$tmp" || { rm -f "$tmp"; return 2; }
+  chmod +x "$tmp" 2>/dev/null || { rm -f "$tmp"; return 2; }
   agmsg_install_op_require || { rm -f "$tmp"; return 1; }
-  mv "$tmp" "$target"
+  mv "$tmp" "$target" 2>/dev/null || { rm -f "$tmp"; return 2; }
   agmsg_install_op_require || return 1
-  if [ -n "$expected_owner" ]; then
-    echo "  + refreshed Antigravity TUI shim (~/.agents/bin/agy-tui)"
-  else
-    echo "  + installed Antigravity TUI shim (~/.agents/bin/agy-tui)"
-  fi
 }
 
 install_antigravity_skill() {
@@ -831,11 +836,26 @@ install_antigravity_skill() {
   fi
   local skill_dir="$HOME/.gemini/config/skills/$CMD_NAME"
   agmsg_install_op_require || return 1
-  mkdir -p "$skill_dir"
+  mkdir -p "$skill_dir" 2>/dev/null || return 2
   agmsg_install_op_require || return 1
-  agmsg_render_skill antigravity "$CMD_NAME" "$skill_dir/SKILL.md"
+  agmsg_render_skill antigravity "$CMD_NAME" "$skill_dir/SKILL.md" 2>/dev/null || return 2
   agmsg_install_op_require || return 1
   echo "  + installed /$CMD_NAME skill to ~/.gemini/config/skills/"
+}
+
+# Run one Antigravity setup step. These steps only matter to someone who uses
+# Antigravity, so a step that cannot write (return 2) warns once and the
+# install or update goes on. Any other failure -- a lost install lock -- still
+# stops it, as before.
+install_antigravity_step() {   # <what> <function> [args...]
+  local what="$1" rc=0
+  shift
+  "$@" || rc=$?
+  case "$rc" in
+    0) ;;
+    2) echo "  ! could not install the Antigravity $what; skipped (installs that do not use Antigravity are unaffected)" >&2 ;;
+    *) exit 1 ;;
+  esac
 }
 
 # --- Parse args ---
@@ -1096,7 +1116,7 @@ $_agmsg_running_team"
     mkdir -p "$GROK_SKILL_DIR" || exit 1
     agmsg_render_skill grok-build "$SKILL_NAME" "$GROK_SKILL_DIR/SKILL.md" || exit 1
   fi
-  install_antigravity_skill || exit 1
+  install_antigravity_step "skill (~/.gemini/config/skills/)" install_antigravity_skill
   agmsg_install_op_phase_end || exit 1
   agmsg_install_op_phase_begin || exit 1
   agmsg_install_optional_copy "$SCRIPT_DIR/openai.yaml" "$SKILL_DIR/agents/openai.yaml"
@@ -1174,7 +1194,7 @@ $_agmsg_running_team"
   # Extensionless entry points the *.sh glob does not reach.
   chmod +x "$SKILL_DIR/scripts/agmsg" "$SKILL_DIR/scripts/daemon/agmsgd" 2>/dev/null || true
   agmsg_install_optional_codex_chmod
-  install_antigravity_tui_shim "$SKILL_DIR/scripts/drivers/types/antigravity/agy-tui.sh" || exit 1
+  install_antigravity_step "TUI launcher shim (~/.agents/bin/agy-tui)" install_antigravity_tui_shim "$SKILL_DIR/scripts/drivers/types/antigravity/agy-tui.sh"
   # Refresh the Codex monitor shim (~/.agents/bin/codex) if it's ours. --update
   # cp's the new codex-shim-install.sh but does not re-run it, so a shim from an
   # older install keeps its stale baked exec path after the
@@ -1211,14 +1231,15 @@ $_agmsg_running_team"
   # how many lines it prints, so growing its output again later can't reopen
   # this.
   CODEX_SHIM="$SKILL_DIR/scripts/drivers/types/codex/codex-shim-install.sh"
+  # While agmsgd delivers Codex notices the shim is not needed: `sync` removes
+  # an agmsg shim owned by this install (and puts it back when agmsgd is off),
+  # so the refresh below then finds nothing to refresh.
+  agmsg_install_sync_codex_shim
   CODEX_SHIM_STATUS=""
   [ -x "$CODEX_SHIM" ] && CODEX_SHIM_STATUS="$(AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" status 2>/dev/null || true)"
   if printf '%s' "$CODEX_SHIM_STATUS" | grep -q '^installed:'; then
     CODEX_SHIM_FORCE="${AGMSG_CODEX_SHIM_FORCE:-}"
     agmsg_install_refresh_codex_shim || exit 1
-    if [ "$AGMSG_CODEX_SHIM_REFRESHED" = true ]; then
-      echo "  + refreshed Codex monitor shim (~/.agents/bin/codex)"
-    fi
   fi
   install_windows_helpers || exit 1
   agmsg_install_op_phase_end || exit 1
@@ -1345,7 +1366,7 @@ chmod +x "$SKILL_DIR/scripts/"*.sh || exit 1
 # Extensionless entry points the *.sh glob does not reach.
 chmod +x "$SKILL_DIR/scripts/agmsg" "$SKILL_DIR/scripts/daemon/agmsgd" 2>/dev/null || true
 agmsg_install_optional_codex_chmod
-install_antigravity_tui_shim "$SKILL_DIR/scripts/drivers/types/antigravity/agy-tui.sh" || exit 1
+install_antigravity_step "TUI launcher shim (~/.agents/bin/agy-tui)" install_antigravity_tui_shim "$SKILL_DIR/scripts/drivers/types/antigravity/agy-tui.sh"
 # Re-point an existing Codex monitor shim at the new path on a reinstall over an
 # older layout (no-op when no agmsg shim is present). See the --update block
 # above. NOT forced (#553): unlike --update, a fresh install here gives no
@@ -1354,6 +1375,7 @@ install_antigravity_tui_shim "$SKILL_DIR/scripts/drivers/types/antigravity/agy-t
 # whichever install already owns it. codex-shim-install.sh itself refuses that
 # and says whose it is; surface that here instead of swallowing it.
 CODEX_SHIM="$SKILL_DIR/scripts/drivers/types/codex/codex-shim-install.sh"
+agmsg_install_sync_codex_shim
 CODEX_SHIM_STATUS=""
 [ -x "$CODEX_SHIM" ] && CODEX_SHIM_STATUS="$(AGMSG_CODEX_SHIM_INSTALL_QUIET=1 "$CODEX_SHIM" status 2>/dev/null || true)"
 if printf '%s' "$CODEX_SHIM_STATUS" | grep -q '^installed:'; then
@@ -1364,9 +1386,6 @@ if printf '%s' "$CODEX_SHIM_STATUS" | grep -q '^installed:'; then
   # different from what actually happens.
   CODEX_SHIM_FORCE=""
   agmsg_install_refresh_codex_shim || exit 1
-  if [ "$AGMSG_CODEX_SHIM_REFRESHED" = true ]; then
-    echo "  + refreshed Codex monitor shim (~/.agents/bin/codex)"
-  fi
 fi
 install_windows_helpers || exit 1
 agmsg_install_op_phase_end || exit 1
@@ -1458,7 +1477,7 @@ fi
 # Antigravity (agy) reads global skills from ~/.gemini/config/skills/<name>/.
 # Its CLI may create ~/.gemini/antigravity-cli before the config directory, so
 # either path is a sufficient installation signal.
-install_antigravity_skill || exit 1
+install_antigravity_step "skill (~/.gemini/config/skills/)" install_antigravity_skill
 agmsg_install_op_phase_end || exit 1
 
 # Codex sandbox writable_roots are configured by configure_codex_sandbox() at

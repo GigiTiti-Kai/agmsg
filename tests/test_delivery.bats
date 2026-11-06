@@ -443,7 +443,7 @@ eperm_pid() {
   local boot
   case "$(uname -s)" in
     Darwin) boot="$(sysctl -n kern.bootsessionuuid)" ;;
-    Linux) boot="$(sed -n 's/^btime //p' /proc/stat)" ;;
+    Linux) boot="$(tr -d "[:space:]" < /proc/sys/kernel/random/boot_id 2>/dev/null || sed -n "s/^btime //p" /proc/stat)" ;;
     *) skip 'POSIX beta executor evidence' ;;
   esac
   sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_intent SET desired='on';
@@ -460,6 +460,36 @@ eperm_pid() {
   sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_intent SET desired='off';"
   run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
   grep -q '^mode: off (unrecognized: no settings file found' <<<"$output"
+}
+
+@test "daemon state: on Linux the boot id is the kernel boot_id, and a record holding btime is unverifiable rather than stopped" {
+  [ "$(uname -s)" = Linux ] || skip 'the Linux boot id'
+  [ -r /proc/sys/kernel/random/boot_id ] || skip 'no kernel boot_id here'
+  mkdir -p "$TEST_SKILL_DIR/run"
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" < "$SCRIPTS/daemon/schema.sql"
+  local boot
+  boot="$(tr -d '[:space:]' < /proc/sys/kernel/random/boot_id)"
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_intent SET desired='on';
+    UPDATE daemon_owner SET state='ready', executor_pid=$$, executor_boot_id='$boot', executor_started_at=strftime('%Y-%m-%dT%H:%M:%fZ','now');"
+  run bash -c 'source "$1/lib/daemon-state.sh"; agmsg_daemon_read_state; echo "$AGMSGD_HEALTH"' _ "$SCRIPTS"
+  [ "${lines[-1]}" = ready ]
+
+  # Written before the id was boot_id: btime moves with a stepped clock (WSL2),
+  # so while the pid exists it cannot be called another boot.
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_owner SET executor_boot_id='1792989040';"
+  run bash -c 'source "$1/lib/daemon-state.sh"; agmsg_daemon_read_state; echo "$AGMSGD_HEALTH"' _ "$SCRIPTS"
+  [ "${lines[-1]}" = unverifiable ]
+
+  # boot_id cannot be read now (btime stands in) against a record that holds the
+  # UUID: an unreadable file is no evidence of another boot.
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_owner SET executor_boot_id='$boot';"
+  run bash -c 'source "$1/lib/daemon-state.sh"; _AGMSG_BOOT_ID_FILE=/nonexistent; agmsg_daemon_read_state; echo "$AGMSGD_HEALTH"' _ "$SCRIPTS"
+  [ "${lines[-1]}" = unverifiable ]
+
+  # A different boot_id is still another boot.
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_owner SET executor_boot_id='0b7e9d34-5c21-4a6f-8d13-7e4a2c9b1f58';"
+  run bash -c 'source "$1/lib/daemon-state.sh"; agmsg_daemon_read_state; echo "$AGMSGD_HEALTH"' _ "$SCRIPTS"
+  [ "${lines[-1]}" = stopped ]
 }
 
 @test "delivery status: a settings file that exists but is not valid JSON is also unrecognized, not deliberate off (review)" {
@@ -1789,8 +1819,7 @@ JSON
   # forbidden one gets the chance to (review on #1327). Nothing here is a
   # condition to poll for.
   sleep 3
-  kill -TERM "$pid" 2>/dev/null
-  wait "$pid" 2>/dev/null || true
+  agmsg_stop_pid "$pid"
 
   grep -q "new-for-bob"   /tmp/agmsg-as-bob
   ! grep -q "new-for-alice" /tmp/agmsg-as-bob \
@@ -1910,8 +1939,7 @@ JSON
   # forbidden one gets the chance to (review on #1327). Nothing here is a
   # condition to poll for.
   sleep 3
-  kill -TERM "$pid" 2>/dev/null
-  wait "$pid" 2>/dev/null || true
+  agmsg_stop_pid "$pid"
 
   grep -q "for-alice-static" /tmp/agmsg-static
   refute grep -q "for-bob-static" /tmp/agmsg-static
@@ -2250,12 +2278,7 @@ JSON
 
 # --- #1003: codex mid-turn PostToolUse hook install/strip/status wiring ---
 #
-# The install is version-gated (#1003 review): the entry goes in only when the
-# codex CLI is confirmed at or above posttooluse_min_cli, fail-closed otherwise.
-# The version is READ from the CLI, never asserted, so these place a fake `codex`
-# on PATH (both the pass and the fail cases) rather than depending on whether a
-# real codex is installed (CI has none). The gate narrows WHO gets the entry
-# written; it does not establish that an older CLI ignores a persisted entry.
+# Installation follows the manifest opt-in even on old or unreadable CLIs.
 
 # A fake `codex` whose `--version` prints $1 (empty $1 => it exits non-zero).
 # Echoes a dir to PREPEND to PATH.
@@ -2313,8 +2336,7 @@ _fake_codex_path() {
   [ "${n:-0}" = "0" ]
 }
 
-# --- version gate: install only at/above the EXACT measured floor, fail-closed ---
-# Boundary controls on both sides: exact floor, floor-minus-one, and a MAX.
+# --- Old and unreadable CLI versions must not withhold mid-turn delivery. ---
 
 @test "delivery set turn (codex): the exact measured floor 0.149.1 installs (#1003)" {
   run env PATH="$(_fake_codex_path '0.149.1'):$PATH" bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT"
@@ -2324,13 +2346,12 @@ _fake_codex_path() {
   [ "${n:-0}" = "1" ]
 }
 
-@test "delivery set turn (codex): floor-minus-one 0.149.0 does NOT install — patch is significant (#1003)" {
+@test "delivery set turn (codex): floor-minus-one 0.149.0 still installs (#1003)" {
   run env PATH="$(_fake_codex_path '0.149.0'):$PATH" bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   local n
   n=$(sqlite_mem "SELECT coalesce(json_array_length(json_extract(readfile('$(rf "$TEST_PROJECT/.codex/hooks.json")'), '\$.hooks.PostToolUse')), 0);" 2>/dev/null || echo 0)
-  [ "${n:-0}" = "0" ]
-  grep -q 'mid-turn delivery (PostToolUse) not installed' <<<"$output"
+  [ "${n:-0}" = "1" ]
   local s
   s=$(sqlite_mem "SELECT json_array_length(json_extract(readfile('$(rf "$TEST_PROJECT/.codex/hooks.json")'), '\$.hooks.Stop'));")
   [ "$s" = "1" ]
@@ -2344,22 +2365,28 @@ _fake_codex_path() {
   [ "${n:-0}" = "1" ]
 }
 
-@test "delivery set turn (codex): an unparseable CLI version does NOT install, fail-closed (#1003)" {
+@test "delivery set turn (codex): pre-PostToolUse 0.116.0 still gets the entry" {
+  run env PATH="$(_fake_codex_path '0.116.0'):$PATH" bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  local n
+  n=$(sqlite_mem "SELECT coalesce(json_array_length(json_extract(readfile('$(rf "$TEST_PROJECT/.codex/hooks.json")'), '\$.hooks.PostToolUse')), 0);")
+  [ "$n" = "1" ]
+}
+
+@test "delivery set turn (codex): an unparseable CLI version still installs (#1003)" {
   run env PATH="$(_fake_codex_path 'banana'):$PATH" bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   local n
   n=$(sqlite_mem "SELECT coalesce(json_array_length(json_extract(readfile('$(rf "$TEST_PROJECT/.codex/hooks.json")'), '\$.hooks.PostToolUse')), 0);" 2>/dev/null || echo 0)
-  [ "${n:-0}" = "0" ]
-  grep -q 'mid-turn delivery (PostToolUse) not installed' <<<"$output"
+  [ "${n:-0}" = "1" ]
 }
 
-@test "delivery set turn (codex): a CLI whose --version fails does NOT install, fail-closed (#1003)" {
+@test "delivery set turn (codex): a CLI whose --version fails still installs (#1003)" {
   run env PATH="$(_fake_codex_path ''):$PATH" bash "$SCRIPTS/delivery.sh" set turn codex "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   local n
   n=$(sqlite_mem "SELECT coalesce(json_array_length(json_extract(readfile('$(rf "$TEST_PROJECT/.codex/hooks.json")'), '\$.hooks.PostToolUse')), 0);" 2>/dev/null || echo 0)
-  [ "${n:-0}" = "0" ]
-  grep -q 'mid-turn delivery (PostToolUse) not installed' <<<"$output"
+  [ "${n:-0}" = "1" ]
 }
 
 @test "delivery set monitor (codex): installs NO PostToolUse entry (#1003)" {
@@ -3644,8 +3671,7 @@ JSON
   run kill -0 "$watch_pid"
   [ "$status" -eq 0 ]
 
-  kill "$watch_pid" 2>/dev/null || true
-  wait 2>/dev/null || true
+  agmsg_stop_pid "$watch_pid"
 }
 
 # --- devin (manual-only: delivery_modes=off, no automatic hook) ---

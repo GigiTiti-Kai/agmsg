@@ -781,6 +781,9 @@ head_of() { git -C "$GIT_BASE/$1/$2.git" rev-parse HEAD; }
   git -C "$w" push -q "$GIT_BASE/acme/pack.git" HEAD:main 2>/dev/null || git -C "$w" push -q "$GIT_BASE/acme/pack.git" HEAD
   PLUGIN install acme/pack --yes >/dev/null
   chmod +x "$w/ext-tools/fx/helper"
+  # Git for Windows keeps core.fileMode off, so a mode-only change is not
+  # recorded there; whether a file runs is then decided by its first bytes.
+  ! git -C "$w" diff --quiet || skip "git does not record mode changes here"
   git -C "$w" commit -qam "make helper executable"
   git -C "$w" push -q "$GIT_BASE/acme/pack.git" HEAD:main 2>/dev/null || git -C "$w" push -q "$GIT_BASE/acme/pack.git" HEAD
   run PLUGIN update acme/pack
@@ -796,6 +799,8 @@ head_of() { git -C "$GIT_BASE/$1/$2.git" rev-parse HEAD; }
   mkdir -p "$outside/pack/keep" "$TEST_SKILL_DIR/plugins/sources/.review"
   echo precious > "$outside/pack/keep/file"
   ln -s "$outside" "$TEST_SKILL_DIR/plugins/sources/.review/acme"
+  # Some Git Bash setups make ln -s copy the directory; there is no link to refuse then.
+  [ -L "$TEST_SKILL_DIR/plugins/sources/.review/acme" ] || skip "ln -s does not create a real symlink here"
   run PLUGIN install acme/pack
   [ "$status" -eq 3 ]
   refute grep -q "^Review copy:" <<<"$output"
@@ -804,4 +809,43 @@ head_of() { git -C "$GIT_BASE/$1/$2.git" rev-parse HEAD; }
   run PLUGIN install acme/pack --yes
   [ "$status" -eq 0 ]
   [ "$(cat "$outside/pack/keep/file")" = precious ]
+}
+
+@test "remove names the members still joined as its ext-tool and how to take them out; reinstall says they work as they are" {
+  mk_repo acme pack >/dev/null
+  PLUGIN install acme/pack --yes >/dev/null
+  mkdir -p "$TEST_SKILL_DIR/teams/alpha"
+  printf '%s\n' '{"name":"alpha","agents":{"desk":{"registrations":[{"type":"ext-tool","project":"(ext-tool:fx)"}]},"me":{"registrations":[{"type":"claude-code","project":"/p"}]}}}' \
+    > "$TEST_SKILL_DIR/teams/alpha/config.json"
+  mkdir -p "$TEST_SKILL_DIR/teams/beta"
+  printf '%s\n' '{"name":"beta","agents":{"board":{"registrations":[{"type":"ext-tool","project":"(ext-tool:fx)"}]}}}' \
+    > "$TEST_SKILL_DIR/teams/beta/config.json"
+  run PLUGIN remove acme/pack
+  [ "$status" -eq 0 ]
+  grep -Fq "These team members used it and are still joined" <<<"$output"
+  grep -qx "  alpha/desk" <<<"$output"
+  grep -qx "  beta/board" <<<"$output"
+  refute grep -qx "  alpha/me" <<<"$output"
+  grep -q "/scripts/leave.sh alpha desk$" <<<"$output"
+
+  run PLUGIN install acme/pack --yes
+  [ "$status" -eq 0 ]
+  grep -Fq "ext-tools/fx is already joined as: alpha/desk, beta/board. It works as it is." <<<"$output"
+  grep -Fq "To add it to another team as well:" <<<"$output"
+}
+
+@test "remove says when the members joined as its ext-tool could not be checked" {
+  mk_repo acme pack >/dev/null
+  PLUGIN install acme/pack --yes >/dev/null
+  mkdir -p "$TEST_SKILL_DIR/teams/alpha"
+  printf 'not json\n' > "$TEST_SKILL_DIR/teams/alpha/config.json"
+  run PLUGIN remove acme/pack
+  [ "$status" -eq 0 ]
+  grep -Fq "Could not check which team members are joined as its ext-tool" <<<"$output"
+  refute grep -Fq "These team members used it" <<<"$output"
+
+  run PLUGIN install acme/pack --yes
+  [ "$status" -eq 0 ]
+  grep -Fq "Whether it is already joined could not be checked" <<<"$output"
+  refute grep -Fq "is already joined as:" <<<"$output"
 }

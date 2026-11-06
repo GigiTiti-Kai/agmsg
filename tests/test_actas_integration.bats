@@ -169,8 +169,7 @@ fake_session() {
   # still be resolving a pair's lock when the old 1s window fired the kill
   # (measured: 1 flake in 3 runs at 1s, 0 in several at 2s).
   sleep 2
-  kill "$wpid" 2>/dev/null || true
-  wait "$wpid" 2>/dev/null || true
+  agmsg_stop_pid "$wpid"
 
   # The header no longer says "held by other sessions": the same list also
   # carries pairs whose lock could not be READ, and those have no holder to name
@@ -195,6 +194,45 @@ fake_session() {
   [ "$(_owner_only T alice)" = "sid-other" ]
 }
 
+# Run watch.sh for alice as <sid> under this test process's pid, long enough
+# to claim (or be refused), then stop it. Output lands in $BATS_TEST_TMPDIR/watch.out.
+_watch_briefly() {   # <sid>
+  AGMSG_AGENT_PID=$$ AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" "$1" /tmp/p1 claude-code alice \
+    >"$BATS_TEST_TMPDIR/watch.out" 2>&1 3>&- &
+  local wpid=$!
+  sleep 3
+  agmsg_stop_pid "$wpid"
+}
+
+# #1807: after a resume or reboot the same session runs under a new process.
+# The seat lock still names the previous owner (the bare session id, or the old
+# composite). The new watch is the same session, so it takes the seat back.
+@test "watch: a lock held by the same bare sid of a dead process is taken back by the resumed session" {
+  skip_on_windows "actas watcher liveness under Git Bash (#182)"
+  fake_register T alice
+  echo "sid-resumed" > "$(actas_lock_path T alice)"
+  echo "sid-resumed.$$" > "$RUN_DIR/cc-instance.$$"
+
+  _watch_briefly sid-resumed
+  refute grep -q "cannot claim" "$BATS_TEST_TMPDIR/watch.out"
+  [ "$(_owner_only T alice)" = "sid-resumed.$$" ]
+}
+
+@test "watch: a lock held by the same bare sid is still refused while another process of that session is alive" {
+  skip_on_windows "actas watcher liveness under Git Bash (#182)"
+  fake_register T alice
+  echo "sid-twin" > "$(actas_lock_path T alice)"
+  sleep 30 &
+  local other=$!
+  echo "sid-twin.$other" > "$RUN_DIR/cc-instance.$other"
+  echo "sid-twin.$$" > "$RUN_DIR/cc-instance.$$"
+
+  _watch_briefly sid-twin
+  kill "$other" 2>/dev/null || true
+  grep -q "cannot claim" "$BATS_TEST_TMPDIR/watch.out"
+  [ "$(_owner_only T alice)" = "sid-twin" ]
+}
+
 @test "watch: with active_name on a free pair, claims and continues" {
   skip_on_windows "actas watcher process mgmt under Git Bash (#182)"
   fake_register T alice
@@ -207,8 +245,7 @@ fake_session() {
   # Should now own the lock.
   [ "$(_owner_only T alice)" = "sid-me" ]
 
-  kill "$wpid" 2>/dev/null || true
-  wait "$wpid" 2>/dev/null || true
+  agmsg_stop_pid "$wpid"
 }
 
 # --- watch.sh releasing a pair it no longer owns (#983) ---
@@ -299,8 +336,7 @@ fake_session() {
   [ "$left" -eq 1 ]
 
   kill "$newpid" 2>/dev/null || true
-  kill "$old" 2>/dev/null || true
-  wait "$old" 2>/dev/null || true
+  agmsg_stop_pid "$old"
 }
 
 # The other half, and the one that decides whether this fix is safe: a watcher
@@ -340,8 +376,7 @@ fake_session() {
   run cat "$BATS_TEST_TMPDIR/broad.err"
   [[ "$output" == *"T/alice"* ]]
 
-  kill "$broad" 2>/dev/null || true
-  wait "$broad" 2>/dev/null || true
+  agmsg_stop_pid "$broad"
 }
 
 # Stepping aside is for as long as someone else holds the role, not forever.
@@ -395,8 +430,7 @@ fake_session() {
   [[ "$output" == *"while they hold it"* ]]
   [[ "$output" == *"unheld again"* ]]
 
-  kill "$broad" 2>/dev/null || true
-  wait "$broad" 2>/dev/null || true
+  agmsg_stop_pid "$broad"
 }
 
 # Names are arbitrary UTF-8 minus a deny-list (validate.sh): a team name may
@@ -447,8 +481,7 @@ fake_session() {
   claims="$(grep -c 'txm/alice was claimed' "$BATS_TEST_TMPDIR/n.err" || true)"
   [ "$claims" -eq 1 ]
 
-  kill "$broad" 2>/dev/null || true
-  wait "$broad" 2>/dev/null || true
+  agmsg_stop_pid "$broad"
 }
 
 # The tree deliberately has no owner-only reader any more (#983): every lock read
