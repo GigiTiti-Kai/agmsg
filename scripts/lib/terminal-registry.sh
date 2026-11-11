@@ -81,6 +81,13 @@
 # only the selected driver is sourced into the caller.
 
 # Source-time lib dir (robust to later subshell/relative cwd).
+# The CR strip for sqlite3 output runs only where sqlite3 emits CRLF.
+_agmsg_crlf_d="${BASH_SOURCE[0]:-$0}"
+case "$_agmsg_crlf_d" in */*) _agmsg_crlf_d="${_agmsg_crlf_d%/*}" ;; *) _agmsg_crlf_d=. ;; esac
+# shellcheck disable=SC1091
+. "$_agmsg_crlf_d/sqlite-crlf.sh"
+unset _agmsg_crlf_d
+
 _AGMSG_TERMINAL_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
 # Pull in the axis-generic registry (bases + trust) if not already sourced.
@@ -1017,7 +1024,7 @@ _agmsg_placement_claimed_by() {
 #   _agmsg_placement_retire_previous <ref> <team> <agent> <instance id>
 _agmsg_placement_retire_previous() {
   local ref="$1" team="$2" agent="$3" instance="$4" suffixes s dir mine lock lockread owner role rt ra
-  local cfg esc m cand="" inteam
+  local cfg esc m cand="" inteam owner_rc
   [ -n "$ref" ] && [ -n "$instance" ] || return 0
   suffixes="$(_agmsg_placement_claimed_by "$ref" "$team" "$agent" all)" || return 0
   [ -n "$suffixes" ] || return 0
@@ -1025,12 +1032,12 @@ _agmsg_placement_retire_previous() {
   dir="$(dirname "$mine")"
   cfg="$(dirname "$dir")/teams/$team/config.json"
   [ -f "$cfg" ] || return 0
-  esc="$(sed "s/'/''/g" "$cfg" 2>/dev/null)" || return 0
+  esc="$(LC_ALL=C sed "s/'/''/g" "$cfg" 2>/dev/null)" || return 0
   while IFS= read -r m; do
     [ -n "$m" ] && [ "$m" != "$agent" ] || continue
     cand="${cand}$(agmsg_spawn_path "$team" "$m" 2>/dev/null)"$'\n'
   done <<EOF
-$(sqlite3 :memory: "SELECT key FROM json_each(json_extract('$esc', '\$.agents'));" 2>/dev/null | tr -d '\r')
+$(agmsg_sqlite_mem "SELECT key FROM json_each(json_extract('$esc', '\$.agents'));" 2>/dev/null)
 EOF
   [ -n "$cand" ] || return 0
   while IFS= read -r s; do
@@ -1048,11 +1055,22 @@ EOF
       absent) ;;
       ok)
         owner="${lockread#*$'\t'}"
-        [ "$owner" = "$instance" ] || continue
-        # A bare owner and a bare instance are equal and prove nothing: two
-        # processes with the same sid look identical. Only a composite pair
-        # says whose the lock is. (A missing check reads as "not composite".)
-        agmsg_instance_is_composite "$instance" 2>/dev/null || continue ;;
+        if [ "$owner" != "$instance" ]; then
+          # Another owner holds the record only while its process is alive. A
+          # composite owner whose process is proven gone (rc 1; "cannot tell" is
+          # 2 and keeps the record) is a session that ended and left its pane
+          # record behind: it must not block the live seat that took the pane
+          # (#1910).
+          agmsg_instance_is_composite "$owner" 2>/dev/null || continue
+          owner_rc=0
+          agmsg_instance_alive "$owner" 2>/dev/null || owner_rc=$?
+          [ "$owner_rc" -eq 1 ] || continue
+        else
+          # A bare owner and a bare instance are equal and prove nothing: two
+          # processes with the same sid look identical. Only a composite pair
+          # says whose the lock is. (A missing check reads as "not composite".)
+          agmsg_instance_is_composite "$instance" 2>/dev/null || continue
+        fi ;;
       *) continue ;;
     esac
     # The naming mark lives in the seat's role-session record, which is keyed by

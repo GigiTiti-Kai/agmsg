@@ -8,7 +8,10 @@ load test_helper
 
 setup() {
   setup_test_env
-  case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) export AGMSG_AGENT_PID="" ;; esac
+  # Pin bare instance-id keying (#93) on every host, not only MSYS2: with no
+  # agent ancestor (CI) the ps walk to pid 1 finds nothing anyway, and pinned
+  # it is skipped.
+  export AGMSG_AGENT_PID=""
   export PROJ="$BATS_TEST_TMPDIR/proj"
   mkdir -p "$PROJ"
   bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
@@ -53,11 +56,17 @@ _run_unfinished_update_watch() {
     bash "$SCRIPTS/watch.sh" sid-note-u "$PROJ" claude-code alice >"$OUT" 2>/dev/null 3>&- 4>&- &
   local pid=$!
   sleep 2
-  # A finished install (VERSION written) whose new watch.sh cannot be exec'd.
+  # A finished install (VERSION written) whose new watch.sh cannot be exec'd. The
+  # watcher stays up and says so; stop it once the line is out.
   chmod -x "$SCRIPTS/watch.sh"
   printf 'new-version\n' > "$TEST_SKILL_DIR/VERSION"
-  _wait_exit "$pid" || { kill "$pid" 2>/dev/null || true; chmod +x "$SCRIPTS/watch.sh"; false; }
-  wait "$pid" || true
+  local i
+  for i in $(seq 1 100); do
+    grep -qF 'installation was updated while this watcher was running' "$OUT" 2>/dev/null && break
+    sleep 0.1
+  done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
   chmod +x "$SCRIPTS/watch.sh"
 }
 
@@ -91,11 +100,11 @@ _run_unfinished_update_watch() {
   refute grep -qF 'agmsgd is on for this project' "$OUT"
 }
 
-@test "watch stop (update never finished): agmsgd on -> same note after the existing restart advice; agmsgd off -> plain" {
+@test "watch stop (update never finished): agmsgd on -> same note after the restart advice; agmsgd off -> plain" {
   _agmsgd_desired on
   _run_unfinished_update_watch
   grep -qF 'installation was updated while this watcher was running' "$OUT"
-  grep -qF 'to resume delivery. agmsgd is on for this project but is not delivering' "$OUT"
+  grep -qF '/agmsg actas <name>). agmsgd is on for this project but is not delivering' "$OUT"
 
   _agmsgd_desired off
   _run_unfinished_update_watch

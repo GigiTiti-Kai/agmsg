@@ -2,6 +2,8 @@
 //! navigation policy) live here with their tests; the pieces that touch the
 //! window system (`host`, `engine`, `probe`) are thin.
 
+pub mod agent_models;
+pub mod agents;
 pub mod broker;
 pub mod catalog;
 pub mod commands;
@@ -28,3 +30,4 @@ pub mod nav;
 pub mod nav_win;
 pub mod panes;
 pub mod server;
+pub mod trust;

@@ -31,16 +31,36 @@ if [ "$#" -gt 0 ] && [ "${!#}" = "--force" ]; then
   set -- "${@:1:$#-1}"
 fi
 
+# Read a body from stdin as bytes. A shell variable cannot hold a NUL, so a body
+# that has one is kept in a file (BODY_NUL_FILE) and the store reads it from
+# there; BODY is then empty. A body without a NUL is read exactly as before
+# ($(cat): trailing newlines dropped) with no process started. The NUL case does
+# no per-NUL work: the text up to the first NUL is already in hand, the rest is
+# copied by one cat, so the cost is linear in the size however many NULs it has.
+BODY_NUL_FILE=""
+_agmsg_read_body() {
+  local _seg _rc=0
+  IFS= read -r -d '' _seg || _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    BODY="${_seg%"${_seg##*[!$'\n']}"}"
+    return 0
+  fi
+  BODY_NUL_FILE="$(mktemp "${TMPDIR:-/tmp}/agmsg-body.XXXXXX")" || die "cannot create a temporary file for a body with a NUL byte"
+  trap 'rm -f "$BODY_NUL_FILE"' EXIT
+  { printf '%s\0' "$_seg"; cat; } > "$BODY_NUL_FILE"
+  BODY=""
+}
+
 case "${1:-}" in
   --body-file)
     [ "$#" -eq 2 ] || die "--body-file takes exactly one path"
     [ -r "${2:-}" ] || die "cannot read body file: ${2:-<missing>}"
-    BODY="$(cat -- "$2")"
+    _agmsg_read_body < "$2"
     ;;
   --body)
     { [ "$#" -eq 2 ] && [ "${2:-}" = "-" ]; } \
       || die "--body accepts only '-' (read stdin); for a file use --body-file <path>"
-    BODY="$(cat)"
+    _agmsg_read_body
     ;;
   '')
     die "Missing message body"
@@ -53,7 +73,7 @@ case "${1:-}" in
     BODY="$1"
     ;;
 esac
-[ -n "$BODY" ] || die "the message body is empty — nothing to send"
+[ -n "$BODY" ] || [ -n "$BODY_NUL_FILE" ] || die "the message body is empty — nothing to send"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
@@ -139,9 +159,29 @@ fi
 # storage_send re-inits its schema idempotently before writing, which subsumes the
 # #114 concurrent first-write race the old path retried around (a process seeing
 # the DB file before the table exists just creates it).
-MSG_ID="$(storage_send "$TEAM" "$FROM" "$TO" "$BODY")"
+MSG_ID="$(storage_send "$TEAM" "$FROM" "$TO" "$BODY" ${BODY_NUL_FILE:+"$BODY_NUL_FILE"})" || _agmsg_send_rc=$?
+if [ -n "${_agmsg_send_rc:-}" ]; then
+  [ -z "$BODY_NUL_FILE" ] || rm -f "$BODY_NUL_FILE"
+  exit "$_agmsg_send_rc"
+fi
 
 echo "Sent to $TO in team $TEAM"
+
+# agmsgd could not reach this recipient's live session for a while (a record in
+# run/down/, scripts/lib/down-notice.sh): the message is stored, and the sender is
+# told it has not been delivered. Builtins only; no record, no output.
+if [ -r "$SCRIPT_DIR/lib/down-notice.sh" ]; then
+  # shellcheck source=scripts/lib/down-notice.sh
+  . "$SCRIPT_DIR/lib/down-notice.sh"
+  _agmsg_seat_key="$(down_notice_key agmsgd.seat "$TEAM/$TO")"
+  while IFS=$'\t' read -r _dn_component _dn_state _dn_since _dn_reason _dn_recovery; do
+    [ "$_dn_component" = "$_agmsg_seat_key" ] || continue
+    # The record's reason already says "messages are stored but not delivered"
+    # for doctor and session start; this line says it once, in its own words.
+    _dn_reason="${_dn_reason%; messages are stored but not delivered}"
+    echo "Note: $TO is not reachable by agmsgd since $_dn_since, so this message is stored but not delivered yet ($_dn_reason)."
+  done < <(down_notice_list)
+fi
 
 # Generic per-type "message arrived" plug (scripts/drivers/types/<type>/_message.sh):
 # lets a type react to a message just sent to one of its own members, without
@@ -183,8 +223,13 @@ if [ -n "${MSG_ID:-}" ] && [ -f "$TEAM_CONFIG" ]; then
         # shellcheck disable=SC1090
         . "$_agmsg_msg_type_dir/_message.sh"
         if declare -F agmsg_type_on_message >/dev/null 2>&1; then
-          _AGMSG_MSG_BODY_FILE="$(mktemp)"
-          printf '%s' "$BODY" > "$_AGMSG_MSG_BODY_FILE"
+          if [ -n "$BODY_NUL_FILE" ]; then
+            # The kept file already holds the exact bytes (a shell variable could not).
+            _AGMSG_MSG_BODY_FILE="$BODY_NUL_FILE"
+          else
+            _AGMSG_MSG_BODY_FILE="$(mktemp)"
+            printf '%s' "$BODY" > "$_AGMSG_MSG_BODY_FILE"
+          fi
           # The `|| true` is load-bearing, not style: this script runs under
           # `set -e`, and this hook is SOURCED into it, so `set -e` is still
           # active inside it -- any command failing partway through the
@@ -196,7 +241,7 @@ if [ -n "${MSG_ID:-}" ] && [ -f "$TEAM_CONFIG" ]; then
           # and the caller decides how this ends" -- shielding the call is
           # what keeps that true regardless of what happens inside the hook.
           agmsg_type_on_message "$TEAM" "$FROM" "$TO" "$MSG_ID" "$_AGMSG_MSG_BODY_FILE" || true
-          rm -f "$_AGMSG_MSG_BODY_FILE"
+          [ "$_AGMSG_MSG_BODY_FILE" = "$BODY_NUL_FILE" ] || rm -f "$_AGMSG_MSG_BODY_FILE"
         fi
       fi
     done

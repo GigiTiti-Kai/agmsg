@@ -107,6 +107,14 @@ impl Panes {
         let ids = {
             let mut reg = self.registry.lock().unwrap();
             let ids = reg.holders(addon, pane, permission, scope);
+            // The team powers are taken back one by one: the pane keeps running (and the agents it started are
+            // normal panes); its next op of that kind is answered `not_granted`.
+            if let Some(power) = super::panes::Power::parse(permission) {
+                for id in &ids {
+                    let _ = reg.set_power(*id, power, false);
+                }
+                return Vec::new();
+            }
             for id in &ids {
                 match permission {
                     "files:read" => reg.revoke_root(*id),
@@ -289,6 +297,14 @@ pub fn addon_grant_team(host: State<'_, Arc<AddonHost>>, id: PaneId, team: Strin
     host.panes.registry.lock().unwrap().grant_team(id, &team)
 }
 
+/// The user allowed (or took back) one of `team:join`, `messages:send`, `agents:spawn` for this pane. Each
+/// needs the team too; the app calls this from the saved consent, never from the frame.
+#[tauri::command]
+pub fn addon_set_power(host: State<'_, Arc<AddonHost>>, id: PaneId, power: String, on: bool) -> Result<(), BrokerError> {
+    let p = super::panes::Power::parse(&power).ok_or_else(|| BrokerError::new("bad_args", "unknown power"))?;
+    host.panes.registry.lock().unwrap().set_power(id, p, on)
+}
+
 #[tauri::command]
 pub fn addon_revoke_team(host: State<'_, Arc<AddonHost>>, id: PaneId) {
     host.panes.registry.lock().unwrap().revoke_team(id);
@@ -396,6 +412,22 @@ fn feed_init_inner(host: &AddonHost, id: PaneId, generation: u64) -> Result<Valu
 /// One request from the pane's port. The answer is ready to post back.
 #[tauri::command(async)]
 pub fn addon_request(host: State<'_, Arc<AddonHost>>, id: PaneId, generation: u64, op: String, args: Value) -> Value {
+    let out = if broker::power_need(&op).is_some() {
+        match super::agents::global() {
+            Some(mgr) => broker::handle_power(&host.panes.registry, &host.panes.deny(), mgr, id, generation, &op, &args),
+            None => Err(BrokerError::new("not_available", "the app is still starting")),
+        }
+    } else {
+        broker::handle(&host.panes.registry, &host.panes.deny(), id, generation, &op, &args)
+    };
+    match out {
+        Ok(result) => json!({ "agmsg": 1, "type": "response", "ok": true, "result": result }),
+        Err(e) => json!({ "agmsg": 1, "type": "response", "ok": false, "error": { "code": e.code, "message": e.message } }),
+    }
+}
+
+#[allow(dead_code)]
+fn addon_request_plain(host: State<'_, Arc<AddonHost>>, id: PaneId, generation: u64, op: String, args: Value) -> Value {
     match broker::handle(&host.panes.registry, &host.panes.deny(), id, generation, &op, &args) {
         Ok(result) => json!({ "agmsg": 1, "type": "response", "ok": true, "result": result }),
         Err(e) => json!({ "agmsg": 1, "type": "response", "ok": false, "error": { "code": e.code, "message": e.message } }),
@@ -424,6 +456,103 @@ pub fn listen_for_live_messages<R: Runtime>(app: &AppHandle<R>, host: Arc<AddonH
     });
 }
 
+/// Largest report the window may make: a batch of notices has a few ids, never this many.
+const MAX_NOTICE_IDS: usize = 50;
+const MAX_NOTICE_ID_LEN: usize = 100;
+
+/// What to push, and to which panes, after the app typed a notice into an agent's pane. `owner` is the agent's
+/// (add-on, team, member) from the journal; only panes of that add-on that hold the spawn power for that team are
+/// told. A report with no ids, too many, or an odd id is dropped whole.
+pub fn notice_pushes(registry: &Registry, owner: Option<(String, String, String)>, ids: &[String], at: u64) -> Vec<(PaneId, u64, Value)> {
+    let Some((addon, team, name)) = owner else { return Vec::new() };
+    if ids.is_empty() || ids.len() > MAX_NOTICE_IDS || ids.iter().any(|i| i.is_empty() || i.len() > MAX_NOTICE_ID_LEN) {
+        return Vec::new();
+    }
+    registry
+        .panes_holding_spawn(&addon, &team)
+        .into_iter()
+        .map(|(pane, generation)| (pane, generation, feed::notice_event(&name, at, ids)))
+        .collect()
+}
+
+/// The window typed a turn notice into the pane of the agent `key` (an agent an add-on started) at `at`, ms since
+/// epoch. Tells that add-on's panes, once per call, and nothing else: a pane with a different add-on, a team it
+/// does not hold the spawn power for, or a key that is not an agent gets nothing. One call per typed notice, no
+/// process.
+#[tauri::command]
+pub fn addon_notice_typed<R: Runtime>(app: AppHandle<R>, host: State<'_, Arc<AddonHost>>, key: String, ids: Vec<String>, at: u64) {
+    let owner = super::agents::global().and_then(|m| m.agent_owner(&key));
+    let pushes = notice_pushes(&host.panes.registry.lock().unwrap(), owner, &ids, at);
+    for (pane, generation, event) in pushes {
+        // re-check right before sending: the grant may have changed since
+        if host.panes.registry.lock().unwrap().authorize(pane, generation, Need::Spawn).is_ok() {
+            let _ = app.emit(PUSH_EVENT, json!({ "pane": pane, "generation": generation, "event": event }));
+        }
+    }
+}
+
+/// At most this many error reports are logged per pane generation, and each is cut to these lengths.
+const MAX_PANE_ERRORS: u32 = 20;
+const MAX_PANE_ERROR_MESSAGE: usize = 500;
+const MAX_PANE_ERROR_STACK: usize = 2000;
+
+/// One log line for an error an add-on's page reported. Control characters become spaces so the add-on cannot
+/// write more than the one line it is given, and the text is cut to a fixed size.
+fn pane_error_line(addon: &str, message: &str, stack: Option<&str>) -> String {
+    let clean = |s: &str, max: usize| -> String { s.chars().take(max).map(|c| if c.is_control() { ' ' } else { c }).collect() };
+    match stack.filter(|s| !s.is_empty()) {
+        Some(st) => format!("[addons] {addon} pane error: {} | {}", clean(message, MAX_PANE_ERROR_MESSAGE), clean(st, MAX_PANE_ERROR_STACK)),
+        None => format!("[addons] {addon} pane error: {}", clean(message, MAX_PANE_ERROR_MESSAGE)),
+    }
+}
+
+/// An add-on's page hit an error it caught (the kit's overlay shows it in the pane); write it to the app's log so it
+/// can be read without opening the web inspector. Only the pane's current generation counts, and a page can log
+/// `MAX_PANE_ERRORS` lines per load, so a loop in the page cannot fill the log. No process is started.
+#[tauri::command]
+pub fn addon_pane_error(host: State<'_, Arc<AddonHost>>, id: PaneId, generation: u64, message: String, stack: Option<String>) {
+    static COUNTS: std::sync::Mutex<Vec<((PaneId, u64), u32)>> = std::sync::Mutex::new(Vec::new());
+    let (addon, current) = {
+        let reg = host.panes.registry.lock().unwrap();
+        (reg.addon_of(id), reg.generation(id))
+    };
+    if !admit_pane_error(&mut COUNTS.lock().unwrap(), id, generation, current) {
+        return;
+    }
+    if let Some(addon) = addon {
+        eprintln!("{}", pane_error_line(&addon, &message, stack.as_deref()));
+    }
+}
+
+/// Whether one more error report from `(id, generation)` is logged. `current` is the pane's current generation, or
+/// None when the pane is gone. A report from an older generation is refused and changes nothing but its own entry:
+/// a late report from an old port must not give the new load its budget back. Entries of older generations of the
+/// pane are dropped once a newer one reports; all of a pane's entries go when the pane is gone.
+fn admit_pane_error(counts: &mut Vec<((PaneId, u64), u32)>, id: PaneId, generation: u64, current: Option<u64>) -> bool {
+    match current {
+        None => {
+            counts.retain(|((p, _), _)| *p != id);
+            return false;
+        }
+        Some(g) if g != generation || generation == 0 => {
+            counts.retain(|(k, _)| *k != (id, generation));
+            return false;
+        }
+        Some(_) => {}
+    }
+    counts.retain(|((p, g), _)| *p != id || *g == generation);
+    match counts.iter_mut().find(|(k, _)| *k == (id, generation)) {
+        Some((_, n)) => {
+            if *n >= MAX_PANE_ERRORS {
+                return false;
+            }
+            *n += 1;
+        }
+        None => counts.push(((id, generation), 1)),
+    }
+    true
+}
+
 /// The watcher's `Message` has exactly the feed fields; keep only those.
 fn strip_to_feed(payload: &str) -> String {
     payload.to_string()
@@ -450,6 +579,40 @@ mod tests {
 
     fn args(path: Option<&str>, url: Option<&str>, base: Option<&str>) -> OpenArgs {
         OpenArgs { path: path.map(Into::into), url: url.map(Into::into), base: base.map(Into::into) }
+    }
+
+    #[test]
+    fn pane_error_budget_is_per_generation_and_a_stale_report_cannot_refill_it() {
+        let mut counts = Vec::new();
+        // pane 7 reloaded to generation 2 and used its whole budget
+        for _ in 0..MAX_PANE_ERRORS {
+            assert!(admit_pane_error(&mut counts, 7, 2, Some(2)));
+        }
+        assert!(!admit_pane_error(&mut counts, 7, 2, Some(2)));
+        // a late report from the old port (generation 1) is refused and must not clear generation 2's count
+        assert!(!admit_pane_error(&mut counts, 7, 1, Some(2)));
+        assert!(!admit_pane_error(&mut counts, 7, 2, Some(2)));
+        // another pane has its own budget
+        assert!(admit_pane_error(&mut counts, 8, 1, Some(1)));
+        // a reload starts a new budget and drops the old entry
+        assert!(admit_pane_error(&mut counts, 7, 3, Some(3)));
+        assert!(!counts.iter().any(|((p, g), _)| *p == 7 && *g == 2));
+        // generation 0 never counts; a pane that is gone loses all its entries
+        assert!(!admit_pane_error(&mut counts, 7, 0, Some(3)));
+        assert!(!admit_pane_error(&mut counts, 7, 3, None));
+        assert!(!counts.iter().any(|((p, _), _)| *p == 7));
+        assert!(counts.iter().any(|((p, _), _)| *p == 8));
+    }
+
+    #[test]
+    fn pane_error_line_is_one_cut_line() {
+        let l = pane_error_line("a/b", "boom\nfake line\u{1b}[31m", Some("at f (x.js:1:2)\nat g"));
+        assert_eq!(l, "[addons] a/b pane error: boom fake line [31m | at f (x.js:1:2) at g");
+        assert!(!l.contains('\n'));
+        let long = "x".repeat(5000);
+        let l = pane_error_line("a/b", &long, Some(&long));
+        assert_eq!(l.chars().count(), "[addons] a/b pane error: ".len() + 500 + 3 + 2000);
+        assert_eq!(pane_error_line("a/b", "m", Some("")), "[addons] a/b pane error: m");
     }
 
     #[test]
@@ -613,5 +776,79 @@ mod tests {
         assert!(panes.feeds.lock().unwrap().is_empty());
         assert!(panes.registry.lock().unwrap().authorize(a.id, g, Need::Current).is_err());
         assert!(panes.close_all().is_empty());
+    }
+
+    // ---- the notice report (the window typed a turn notice into an add-on agent's pane)
+
+    fn spawn_pane(r: &mut Registry, addon: &str, team: &str) -> (PaneId, u64) {
+        use crate::addons::panes::Power;
+        let mut files = HashMap::new();
+        files.insert("index.html".to_string(), b"<div></div>".to_vec());
+        let id = r
+            .add(AddPane {
+                addon: addon.into(),
+                commit: "c".into(),
+                name: "n".into(),
+                payload: Payload::Embedded(files),
+                entry: "index.html".into(),
+                declared: Declared { team_join: true, messages_send: true, agents_spawn: true, ..Default::default() },
+                open_args: OpenArgs::default(),
+                expected_digest: None,
+                pinned: None,
+                on_tamper: None,
+            })
+            .unwrap()
+            .id;
+        let g = r.begin_generation(id).unwrap();
+        r.grant_team(id, team).unwrap();
+        r.set_power(id, Power::Join, true).unwrap();
+        r.set_power(id, Power::Spawn, true).unwrap();
+        (id, g)
+    }
+
+    fn owner(addon: &str, team: &str, name: &str) -> Option<(String, String, String)> {
+        Some((addon.into(), team.into(), name.into()))
+    }
+
+    #[test]
+    fn a_typed_notice_is_reported_only_to_the_owning_add_ons_panes_for_that_team() {
+        let mut r = Registry::new();
+        let (mine, g) = spawn_pane(&mut r, "o/r", "t");
+        let (_other_addon, _) = spawn_pane(&mut r, "x/y", "t");
+        let (_other_team, _) = spawn_pane(&mut r, "o/r", "u");
+        let ids = vec!["m1".to_string()];
+        let out = notice_pushes(&r, owner("o/r", "t", "white"), &ids, 1234);
+        assert_eq!(out.len(), 1, "one pane: the owner's, in that team");
+        assert_eq!((out[0].0, out[0].1), (mine, g));
+        assert_eq!(out[0].2, json!({ "agmsg": 1, "type": "notice", "name": "white", "at": 1234, "ids": ["m1"] }));
+        assert!(!out[0].2.to_string().contains("body"), "no text goes along");
+    }
+
+    #[test]
+    fn a_report_for_something_that_is_not_an_add_on_agent_pushes_nothing() {
+        let mut r = Registry::new();
+        spawn_pane(&mut r, "o/r", "t");
+        assert!(notice_pushes(&r, None, &["m1".to_string()], 1).is_empty(), "no journal agent behind the key");
+    }
+
+    #[test]
+    fn a_report_with_no_ids_too_many_or_an_odd_one_is_dropped() {
+        let mut r = Registry::new();
+        spawn_pane(&mut r, "o/r", "t");
+        let o = || owner("o/r", "t", "white");
+        assert!(notice_pushes(&r, o(), &[], 1).is_empty());
+        assert!(notice_pushes(&r, o(), &vec!["x".to_string(); MAX_NOTICE_IDS + 1], 1).is_empty());
+        assert!(notice_pushes(&r, o(), &["".to_string()], 1).is_empty());
+        assert!(notice_pushes(&r, o(), &["y".repeat(MAX_NOTICE_ID_LEN + 1)], 1).is_empty());
+        assert_eq!(notice_pushes(&r, o(), &vec!["x".to_string(); MAX_NOTICE_IDS], 1).len(), 1);
+    }
+
+    #[test]
+    fn a_pane_that_lost_the_spawn_power_is_no_longer_told() {
+        use crate::addons::panes::Power;
+        let mut r = Registry::new();
+        let (id, _) = spawn_pane(&mut r, "o/r", "t");
+        r.set_power(id, Power::Spawn, false).unwrap();
+        assert!(notice_pushes(&r, owner("o/r", "t", "white"), &["m1".to_string()], 1).is_empty());
     }
 }

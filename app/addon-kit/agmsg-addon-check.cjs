@@ -15,8 +15,9 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const LIMITS = { totalBytes: 200 * 1024 * 1024, files: 5000, fileBytes: 50 * 1024 * 1024 };
-const PERMISSIONS = new Set(['messages:read', 'files:read', 'git:read', 'network']);
-const KEYS = new Set(['title', 'entry', 'min_app', 'protocol', 'permissions', 'network', 'opens']);
+const PERMISSIONS = new Set(['messages:read', 'files:read', 'git:read', 'network', 'team:join', 'messages:send', 'agents:spawn']);
+const KEYS = new Set(['title', 'entry', 'min_app', 'protocol', 'permissions', 'network', 'opens', 'member', 'locales', 'default']);
+const LANG_TAG = /^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$/;
 const OPENS = new Set(['path', 'url']);
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const RESERVED = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i;
@@ -57,6 +58,15 @@ function list(v) {
   return v ? v.split(',').map((s) => s.trim()).filter(Boolean) : [];
 }
 
+// The rules of agmsg_validate_agent_name (scripts/lib/validate.sh), the same ones the app applies.
+function memberNameProblem(name) {
+  if (!name) return 'must not be empty';
+  if (name === '.' || name === '..') return 'must not be "." or ".."';
+  if (name.startsWith('-')) return 'must not start with "-"';
+  if (/[./\\"\[\]\u0000-\u001f\u007f]/.test(name)) return 'must not contain . / \\ " [ ] or control characters';
+  return null;
+}
+
 function checkConf(confPath, rel) {
   const out = { errors: [], warnings: [], conf: null };
   const { values, errors } = parseConf(fs.readFileSync(confPath, 'utf8'));
@@ -78,6 +88,17 @@ function checkConf(confPath, rel) {
   }
   if (perms.includes('git:read') && !perms.includes('files:read')) {
     out.errors.push(at('permissions') + ': git:read needs files:read too.');
+  }
+  for (const p of ['messages:send', 'agents:spawn']) {
+    if (perms.includes(p) && !perms.includes('team:join')) out.errors.push(at('permissions') + ': ' + p + ' needs team:join too.');
+  }
+  if (values.member) {
+    if (!perms.includes('team:join')) {
+      out.errors.push(at('member') + ': "member" is set but the team:join permission is not declared.');
+    } else {
+      const why = memberNameProblem(values.member.value);
+      if (why) out.errors.push(at('member') + ': member ' + why + '.');
+    }
   }
   if (perms.includes('network')) {
     if (!values.network || !values.network.value) {
@@ -105,7 +126,26 @@ function checkConf(confPath, rel) {
       if (!OPENS.has(o)) out.errors.push(at('opens') + ': unknown "' + o + '" (path or url).');
     }
   }
+  // Advisory, so a problem is a warning and the entry is dropped; it never makes the app refuse the add-on.
+  const locales = [];
+  for (const t of values.locales ? list(values.locales.value) : []) {
+    if (!LANG_TAG.test(t)) out.warnings.push(at('locales') + ': "' + t + '" is not a language tag like en or pt-BR; ignored.');
+    else if (locales.some((o) => o.toLowerCase() === t.toLowerCase())) out.warnings.push(at('locales') + ': "' + t + '" is listed twice; ignored.');
+    else locales.push(t);
+  }
+  let defaultLocale = 'en';
+  if (values.default && values.default.value) {
+    if (!LANG_TAG.test(values.default.value)) {
+      out.warnings.push(at('default') + ': "' + values.default.value + '" is not a language tag like en or pt-BR; "en" is used.');
+    } else {
+      defaultLocale = values.default.value;
+      if (locales.length && !locales.some((l) => l.toLowerCase() === defaultLocale.toLowerCase())) {
+        out.warnings.push(at('default') + ': "' + defaultLocale + '" is not in "locales".');
+      }
+    }
+  }
   out.conf = {
+    locales,
     entry: (values.entry && values.entry.value) || 'index.html',
     permissions: perms,
     network: values.network ? values.network.value : '',
@@ -255,6 +295,10 @@ function collect(root, limits) {
     const untrackedWeb = tree.untracked.filter((f) => f.startsWith(webPrefix));
     if (untrackedWeb.length) {
       warnings.push(untrackedWeb.length + ' file(s) in ' + webPrefix + ' are not committed yet (e.g. ' + untrackedWeb[0] + ').');
+    }
+    for (const l of c.conf.locales) {
+      const f = webPrefix + 'locales/' + l + '.json';
+      if (!fs.existsSync(path.join(root, f))) warnings.push(rel + ': "locales" lists ' + l + ' but ' + f + ' is missing.');
     }
     const s = scanWeb(root, webFiles.length ? webFiles : untrackedWeb, c.conf);
     blocked.push(...s.errors);

@@ -13,7 +13,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 INSTALL_DB="$SKILL_DIR/run/install.db"
-LOCK_DB="$SKILL_DIR/run/install-op.lock.db"
+LOCK_DB="$SKILL_DIR/.install-op/lock.db"
 LAUNCHER="$SCRIPT_DIR/daemon/agmsgd-launch.sh"
 # shellcheck source=lib/daemon-state.sh
 source "$SCRIPT_DIR/lib/daemon-state.sh"
@@ -29,6 +29,10 @@ source "$SCRIPT_DIR/lib/sqlpath.sh"
 source "$SCRIPT_DIR/lib/node.sh"
 # shellcheck source=lib/hash.sh
 source "$SCRIPT_DIR/lib/hash.sh"
+# shellcheck source=lib/update-command.sh
+source "$SCRIPT_DIR/lib/update-command.sh"
+# shellcheck source=lib/down-notice.sh
+source "$SCRIPT_DIR/lib/down-notice.sh"
 
 _path_hint() {
   printf 'If agmsg is not found, use "%s/scripts/agmsg" daemon %s.\n' "$SKILL_DIR" "$1"
@@ -123,15 +127,36 @@ _with_op_lock() {
   return "$rc"
 }
 
+# True while an install or update of THIS install is alive: its incomplete-
+# operation record exists and the pid it names is still running. A record left by
+# an operation that was killed is not "running".
+_install_operation_running() {
+  local record="$SKILL_DIR/run/install-op-incomplete.json" pid
+  [ -f "$record" ] || return 1
+  pid="$(sed -n 's/.*"actor_pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$record" 2>/dev/null | head -n 1)"
+  case "$pid" in ''|0|1) return 1 ;; esac
+  _agmsg_pid_alive_local "$pid"
+}
+
 _with_op_lock_run() {
   local statements="$1" expected_generation current_generation ready applied lock_pid attach_path lock_dir
   local AGMSGD_LOCK_INSTALL_ID
   shift
   expected_generation="$(_install_generation)" || {
-    echo "agmsg daemon: could not read this install's record (run/install-manifest.json does not match run/install.db, or one of them cannot be read). Repair it with: npx agmsg@next install --update (add --cmd <name> if this is a named install or several installs exist), then try again." >&2
+    # While an install or update runs, the completion record is moved aside and
+    # does not match install.db yet: nothing is broken, and the update starts an
+    # enabled agmsgd again when it is done.
+    if _install_operation_running; then
+      echo "agmsg daemon: another agmsg install or update is running; agmsgd will start when it finishes." >&2
+      return 1
+    fi
+    echo "agmsg daemon: could not read this install's record (run/install-manifest.json does not match run/install.db, or one of them cannot be read). Repair it with: $(agmsg_update_command "$SKILL_DIR"), then try again." >&2
     return 1
   }
   AGMSGD_LOCK_INSTALL_ID="${expected_generation%%:*}"
+  # The lock lives in .install-op/ at the install root; the installer makes it,
+  # and an install that predates it gets it here.
+  mkdir -p "${LOCK_DB%/*}" 2>/dev/null || true
   lock_dir="$(mktemp -d "$SKILL_DIR/run/daemon-op-lock.XXXXXX")" || return 1
   if [ "$(_os)" = windows ] && [ "${BASH_VERSINFO[0]}" -ge 4 ]; then
     # The native sqlite3 on Windows cannot be driven through an MSYS FIFO (it
@@ -348,8 +373,16 @@ _systemd_unit_path_dirs() {
 }
 
 # NOT YET RUN ON LINUX in this environment -- configured with
-# (Restart=on-failure, RestartSec=30s, StartLimitIntervalSec=600,
-# StartLimitBurst=5) and shellchecked only.
+# (Restart=on-failure, RestartSec=30s) and shellchecked only.
+#
+# StartLimitBurst=0 turns off systemd's own restart-rate limiting (its
+# default is 5 restarts within a 10s window when unset -- not "no limit").
+# agmsgd is a resident a user expects to come back on its own; a crash loop
+# giving up and sitting dead until someone manually runs `systemctl --user
+# reset-failed` is exactly the terminal stop class B/C work (1.7.2, decision
+# 11-04) is removing. RestartSec=30s already bounds the retry rate (one
+# attempt per 30s, same as before), so this keeps backoff while dropping the
+# burst cap that used to end it permanently (S04).
 _register_linux() {
   local node_path="$1" unit_path unit_name unit_env
   unit_path="$(_systemd_unit_path)"
@@ -362,7 +395,7 @@ _register_linux() {
 [Unit]
 Description=agmsgd ($SKILL_DIR)
 StartLimitIntervalSec=600
-StartLimitBurst=5
+StartLimitBurst=0
 
 [Service]
 ExecStart=$LAUNCHER
@@ -375,6 +408,39 @@ WantedBy=default.target
 EOF
   "$AGMSGD_SYSTEMCTL" --user daemon-reload
   "$AGMSGD_SYSTEMCTL" --user enable "$unit_name"
+}
+
+# A unit registered before this fix (StartLimitBurst=5) can still be sitting
+# "failed" (systemd gave up restarting it) when this code runs. One
+# self-heal attempt per status/doctor check: clear the failure latch and
+# start it again. Desired=off is never looked at here by design -- an
+# explicitly disabled unit has no unit file at all (_unregister_linux
+# removes it), so there is nothing for "systemctl is-failed" to ever match
+# in that case; this never fights an explicit `agmsg daemon disable`.
+# Leaves a down_notice only when the self-heal attempt itself fails, cleared
+# the moment the unit is next seen running.
+_linux_recover_if_failed() {
+  _systemd_user_usable || return 0
+  local unit_path unit_name
+  unit_path="$(_systemd_unit_path)"
+  [ -f "$unit_path" ] || return 0
+  unit_name="$(basename "$unit_path")"
+  if [ "$("$AGMSGD_SYSTEMCTL" --user is-active "$unit_name" 2>/dev/null)" = active ]; then
+    # A notice is diagnostic, not load-bearing: an I/O failure here
+    # (rc 1, per the shared down-notice.sh contract) must never abort
+    # this function or the command that called it.
+    down_notice_clear agmsgd || :
+    return 0
+  fi
+  [ "$("$AGMSGD_SYSTEMCTL" --user is-failed "$unit_name" 2>/dev/null)" = failed ] || return 0
+  "$AGMSGD_SYSTEMCTL" --user reset-failed "$unit_name" >/dev/null 2>&1 || true
+  if "$AGMSGD_SYSTEMCTL" --user start "$unit_name" >/dev/null 2>&1; then
+    down_notice_clear agmsgd || :
+  else
+    down_notice_set agmsgd down \
+      "systemd gave up restarting agmsgd and the automatic reset-failed + start retry also failed" \
+      "systemctl --user reset-failed $unit_name && agmsg daemon start" || :
+  fi
 }
 
 _unregister_linux() {
@@ -694,6 +760,7 @@ cmd_start() {
   running_node="$(_resolve_node 2>/dev/null || true)"
   if [ "$state" = "ready" ] && [ -n "$running_node" ] && "$running_node" "$SCRIPT_DIR/daemon/status.mjs" "$SKILL_DIR" >/dev/null 2>&1; then
     echo "agmsg daemon start: already running"
+    _agmsg_down_notice_clear_if_present agmsgd
     agmsg_daemon_seat_report start
     _path_hint status
     return 0
@@ -709,10 +776,14 @@ cmd_start() {
     found_node="$(_resolve_node)" || {
       echo "agmsg daemon start: no usable Node found (need >= 22.13.0 with node:sqlite), so agmsgd cannot start. Nothing was changed. Install Node from https://nodejs.org/en/download, then run agmsg daemon start." >&2
       _path_hint start >&2
+      # A real daemon_start_attempts row, same as every other refusal here
+      # -- this one was simply missing before. "no usable Node" keys
+      # daemon-state.sh's existing *Node*/*node* recovery text.
+      agmsg_sqlite "$INSTALL_DB" "INSERT INTO daemon_start_attempts VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'no usable Node found', $$);" 2>/dev/null || true
       return 1
     }
     found_version="$("$found_node" -e 'console.log(process.versions.node)')"
-    record_node_sql="UPDATE meta SET node_path = '$(printf '%s' "$found_node" | sed "s/'/''/g")', node_version = '$found_version';"
+    record_node_sql="UPDATE meta SET node_path = '$(printf '%s' "$found_node" | LC_ALL=C sed "s/'/''/g")', node_version = '$found_version';"
   fi
 
   # An install enabled by an earlier version (or updated before Codex was on
@@ -721,7 +792,7 @@ cmd_start() {
   local codex_fill="" codex_path
   codex_path="$(_resolve_codex 2>/dev/null || true)"
   if [ -n "$codex_path" ]; then
-    codex_fill="UPDATE meta SET codex_path = '$(printf '%s' "$codex_path" | sed "s/'/''/g")' WHERE COALESCE(codex_path, '') = '';"
+    codex_fill="UPDATE meta SET codex_path = '$(printf '%s' "$codex_path" | LC_ALL=C sed "s/'/''/g")' WHERE COALESCE(codex_path, '') = '';"
   fi
   local new_op_gen
   local start_where=""
@@ -757,6 +828,7 @@ cmd_start() {
   done
   if [ "$ready_rc" = 0 ]; then
     echo "agmsg daemon start: running"
+    _agmsg_down_notice_clear_if_present agmsgd
     agmsg_daemon_seat_report start
     _path_hint status
   else
@@ -833,6 +905,16 @@ cmd_status() {
       *) _usage; return 2 ;;
     esac
   done
+  if [ "$(_os)" = linux ]; then _linux_recover_if_failed || true; fi
+  # Show agmsgd's own down_notice record (if any) in the TEXT output only --
+  # the JSON contract (status.mjs's object, or the K14 fallback's
+  # json_object(...) below) is unchanged (review round 2). The record
+  # outlives any single call site that set it (install.sh's own failed
+  # restart attempt, this function's own _linux_recover_if_failed above),
+  # so this is the one place "agmsg daemon status" always surfaces it.
+  if [ "$json" != true ]; then
+    down_notice_list 2>/dev/null | awk -F'\t' '$1 == "agmsgd"' | _down_notice_text
+  fi
   local owner_tables
   # Only a database that answers and has no daemon_owner table is "not in use
   # yet"; a query that fails (corrupt, locked) falls through to the normal
@@ -935,7 +1017,7 @@ cmd_enable() {
   local was_registered=0
   ! _service_registered || was_registered=1
   _with_op_lock "
-    UPDATE meta SET node_path = '$(printf '%s' "$node_path" | sed "s/'/''/g")', node_version = '$node_version', codex_path = '$(printf '%s' "$codex_path" | sed "s/'/''/g")';
+    UPDATE meta SET node_path = '$(printf '%s' "$node_path" | LC_ALL=C sed "s/'/''/g")', node_version = '$node_version', codex_path = '$(printf '%s' "$codex_path" | LC_ALL=C sed "s/'/''/g")';
     UPDATE daemon_intent SET desired = 'on';
   " _register "$node_path" || {
     if [ "$OP_LOCK_NOT_ACQUIRED" = 1 ]; then
@@ -1079,7 +1161,7 @@ cmd_offer() {
     claude-code|codex) ;;
     *) echo "agmsgd=unavailable reason=agmsgd does not deliver to $type sessions"; return 0 ;;
   esac
-  desired="$(sqlite3 -readonly -cmd '.timeout 100' "$INSTALL_DB" 'SELECT desired FROM daemon_intent;' 2>/dev/null | tr -d '\r' || true)"
+  desired="$(sqlite3 -readonly -cmd '.timeout 100' "$INSTALL_DB" 'SELECT desired FROM daemon_intent;' 2>/dev/null | LC_ALL=C tr -d '\r' || true)"
   if [ "$desired" = on ]; then
     # Turned on is an intent, not proof that notices are being delivered:
     # a failed start or a stopped executor leaves it on with nothing running.
@@ -1109,7 +1191,7 @@ cmd_offer() {
       const { checkWindowsCodexQueueGate } = await import(process.argv[1]);
       const gate = checkWindowsCodexQueueGate({ executable: "codex" });
       console.log(gate.state === "ok" ? "ok" : gate.reason);
-    ' "file://$(cd "$SCRIPT_DIR/daemon/channels" && pwd -W 2>/dev/null || pwd)/windows-codex-queue.mjs" 2>/dev/null | tr -d '\r')" || found="windows_codex_version_unreadable"
+    ' "file://$(cd "$SCRIPT_DIR/daemon/channels" && pwd -W 2>/dev/null || pwd)/windows-codex-queue.mjs" 2>/dev/null | LC_ALL=C tr -d '\r')" || found="windows_codex_version_unreadable"
     if [ "$found" != ok ]; then
       echo "agmsgd=unavailable reason=agmsgd needs Codex 0.157 or newer on Windows ($found)"
       return 0

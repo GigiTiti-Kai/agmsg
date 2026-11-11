@@ -88,7 +88,7 @@ agmsg_resolve_codex_thread() {
       [ -f "$f" ] || continue
       first=$(head -1 "$f" 2>/dev/null)
       case "$first" in *'"session_meta"'*) ;; *) continue ;; esac
-      esc=$(printf '%s' "$first" | sed "s/'/''/g")
+      esc=$(printf '%s' "$first" | LC_ALL=C sed "s/'/''/g")
       cwd=$(agmsg_sqlite_mem "SELECT COALESCE(json_extract('$esc','\$.payload.cwd'),'')" 2>/dev/null)
       cwd_phys=$(agmsg_canonical_path "$cwd")
       [ "$cwd_phys" = "$project_phys" ] || continue
@@ -143,6 +143,17 @@ agmsg_codex_unseated_notice() {
 }
 
 agmsg_session_start() {
+  # #1947: this plug has no path that keeps the generic Monitor directive --
+  # codex has no Monitor tool at all (top-of-file comment) -- so it always
+  # skips that directive. It used to do that with `exit 0`, which, because
+  # this function is SOURCED and CALLED in session-start.sh's own top-level
+  # shell rather than a subshell, ended session-start.sh itself and silently
+  # skipped every type-agnostic block written below the plug call too (the
+  # #774 sync-autostart trigger and the down_notice print among them), for
+  # every single Codex session start, unconditionally. RETURN instead, with
+  # this flag set, so the caller still runs those blocks before deciding
+  # (correctly, every time here) to skip its own directive.
+  AGMSG_SESSION_START_SKIP_DIRECTIVE=1
   # #1477: report, once, if this profile's Codex config is missing this
   # install's writable_roots (Codex installed after agmsg, so
   # configure_codex_sandbox never saw a config to write into). Read-only,
@@ -157,7 +168,7 @@ agmsg_session_start() {
   thread_id="$(agmsg_resolve_codex_thread "$PROJECT")"
   if [ -z "$thread_id" ]; then
     agmsg_codex_unseated_notice
-    exit 0
+    return 0
   fi
   # A recorded role belongs to its recorded Codex thread. The in-sandbox
   # fallback has no launcher to arbitrate this, so exclude a mismatched role
@@ -214,9 +225,22 @@ agmsg_session_start() {
     agent_pid=$(agmsg_agent_pid "$TYPE" 2>/dev/null || true)
     if [ -n "$agent_pid" ]; then
       agent_cmd=$(compat_get_cmdline "$agent_pid" 2>/dev/null || true)
+      # A `unix://` with a path. The managed daemon's own command line carries a
+      # bare `--listen unix://` (its default control socket); that is not an
+      # address a bridge can connect to, so it is resolved below instead.
       app_server=$(printf '%s\n' "$agent_cmd" \
-        | sed -n 's/.*\(unix:\/\/[^[:space:]]*\).*/\1/p' \
+        | sed -n 's/.*\(unix:\/\/[^[:space:]][^[:space:]]*\).*/\1/p' \
         | head -1)
+      if [ -z "$app_server" ]; then
+        case " $agent_cmd " in
+          *" unix:// "*|*"=unix:// "*)
+            default_socket="${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock"
+            if [ -S "$default_socket" ]; then
+              app_server="unix://$default_socket"
+            fi
+            ;;
+        esac
+      fi
     fi
   fi
   if [ -z "$app_server" ]; then
@@ -236,7 +260,7 @@ agmsg_session_start() {
     # unset SKILL_DIR or PROJECT here would not fail loudly, it would just
     # never find the app-server and fall through to the "no app_server" exit
     # below for the wrong reason (#1234 review).
-    [ -n "${SKILL_DIR:-}" ] && [ -n "${PROJECT:-}" ] || exit 0
+    [ -n "${SKILL_DIR:-}" ] && [ -n "${PROJECT:-}" ] || return 0
     if ! command -v _agmsg_codex_app_server_url >/dev/null 2>&1; then
       # shellcheck disable=SC1091
       . "$SKILL_DIR/scripts/drivers/types/codex/_app-server.sh"
@@ -254,7 +278,7 @@ agmsg_session_start() {
       . "$SKILL_DIR/scripts/drivers/types/codex/_seat-key.sh"
     fi
     seat_key="${AGMSG_CODEX_SEAT_KEY:-}"
-    _agmsg_codex_seat_key_ok "$seat_key" || exit 0
+    _agmsg_codex_seat_key_ok "$seat_key" || return 0
     request_file="$request_run_dir/codex-bridge-request.$seat_key"
     tmp_request="$request_file.$$"
     mkdir -p "$request_run_dir" 2>/dev/null || true
@@ -273,10 +297,43 @@ EOF
       printf '%s\t%s\t%s\t\n' "$request_type_value" "$thread_id" "$app_server" > "$tmp_request"
     fi
     mv "$tmp_request" "$request_file"
-    exit 0
+    return 0
   fi
 
-  [ -n "$app_server" ] || exit 0
+  # The direct path below starts a bridge from this hook. With agmsgd turned on
+  # for this project, agmsgd delivers Codex notices (codex-shim.sh and
+  # codex-monitor.sh already start plain Codex for the same reason), so a bridge
+  # here would deliver the same notice a second time. Step aside and say so.
+  # Turning agmsgd off, or the project choosing another delivery, restores the
+  # bridge at the next session start; an unknown state changes nothing. The
+  # launcher branch above only writes a request file and is not touched.
+  if ! declare -F agmsg_daemon_read_state >/dev/null 2>&1; then
+    # shellcheck disable=SC1091
+    . "$SKILL_DIR/scripts/lib/daemon-state.sh"
+  fi
+  agmsg_daemon_read_state
+  agmsg_daemon_apply_project_choice codex "$PROJECT"
+  if [ "${AGMSGD_DESIRED:-unknown}" = on ]; then
+    # The bridge stays off whether or not agmsgd is up (no implicit fallback),
+    # so the line says which state it is: only a ready agmsgd delivers, only a
+    # stopped one is "not running", and one whose state cannot be established
+    # (unchecked / unverifiable) is reported as unchecked. Every command names
+    # THIS install's own scripts/agmsg, never a bare `agmsg`, which on a --cmd
+    # install would operate the default one.
+    gate_cmd="\"$SKILL_DIR/scripts/agmsg\""
+    gate_back="To use the bridge instead, run: $gate_cmd daemon disable (or choose another delivery for this project)."
+    case "${AGMSGD_HEALTH:-}" in
+      ready)
+        echo "AGMSG delivery: agmsgd delivers notices for this session; no Codex bridge is started. $gate_back" ;;
+      stopped)
+        echo "AGMSG delivery: agmsgd is on for this project but is not running (${AGMSGD_REASON:-no reason recorded}), so notices are NOT delivered to this session and no Codex bridge is started. Start it with: $gate_cmd daemon start. $gate_back" ;;
+      *)
+        echo "AGMSG delivery: agmsgd is on for this project and no Codex bridge is started, but agmsgd's state could not be checked (${AGMSGD_REASON:-no reason recorded}), so delivery to this session is not confirmed. Check it with: $gate_cmd daemon status. $gate_back" ;;
+    esac
+    return 0
+  fi
+
+  [ -n "$app_server" ] || return 0
 
   mkdir -p "$RUN_DIR" 2>/dev/null || true
   # #1470 review round 5: derived through the one shared function
@@ -289,7 +346,7 @@ EOF
     . "$SKILL_DIR/scripts/drivers/types/codex/_bridge-key.sh"
   fi
   bridge_key="$(agmsg_codex_bridge_key "$PROJECT" "$thread_id")"
-  [ -n "$bridge_key" ] || exit 0
+  [ -n "$bridge_key" ] || return 0
   bridge_pairs=()
   while IFS=$'\t' read -r candidate_team candidate_name; do
     bridge_pairs+=(--pair "$candidate_team"$'\t'"$candidate_name")
@@ -316,7 +373,7 @@ EOF
   if [ -f "$pidfile" ]; then
     bridge_pid=$(cat "$pidfile" 2>/dev/null || true)
     if [ -n "$bridge_pid" ] && _agmsg_pid_alive "$bridge_pid"; then
-      exit 0
+      return 0
     fi
   fi
   thread_file="$RUN_DIR/codex-bridge.$bridge_key.thread"
@@ -362,5 +419,5 @@ EOF
       >>"$log" 2>&1 3>&- 4>&- &
   )
   printf '%s' "$thread_id" > "$thread_file" 2>/dev/null || true
-  exit 0
+  return 0
 }
