@@ -47,6 +47,13 @@ struct PtySession {
 #[derive(Default)]
 pub struct PtyManager {
     sessions: Arc<Mutex<HashMap<String, PtySession>>>,
+    /// One lock per pane id: an injection (text, gap, Enter) holds it for the whole transaction, so two
+    /// injections into one pane can never interleave, whatever order the workers run in.
+    inject_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+fn pane_lock(locks: &Mutex<HashMap<String, Arc<Mutex<()>>>>, id: &str) -> Arc<Mutex<()>> {
+    Arc::clone(locks.lock().unwrap().entry(id.to_string()).or_default())
 }
 
 impl PtyManager {
@@ -66,11 +73,17 @@ impl PtyManager {
             for (id, tail, detection) in snapshots {
                 let tail = tail.lock().unwrap().detection_tail();
                 if let Some(state) = detection.lock().unwrap().observe(&tail, now) {
+                    eprintln!("[agmsg-app] agent-state {id} -> {state:?} emitted at {} ms", unix_ms());
                     let _ = app.emit("agent-state", AgentStateEvent { id, state });
                 }
             }
         });
     }
+}
+
+/// Wall-clock milliseconds for log lines, so the app's lines can be lined up with an agent's own transcript.
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
 }
 
 #[derive(Clone, Serialize)]
@@ -149,6 +162,31 @@ pub fn pty_spawn(
     cwd: Option<String>,
     rows: Option<u16>,
     cols: Option<u16>,
+    agent_key: Option<String>,
+) -> Result<(), String> {
+    let key = agent_key.clone();
+    let out = pty_spawn_inner(app, manager, id, cmd, args, cwd, rows, cols, agent_key);
+    // an agent an add-on started that did not start must not stay `opening`
+    if let (Err(e), Some(key)) = (&out, &key) {
+        if let Some(m) = crate::addons::agents::global() {
+            m.open_failed(key, e);
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pty_spawn_inner(
+    app: AppHandle,
+    manager: State<'_, PtyManager>,
+    id: String,
+    cmd: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    rows: Option<u16>,
+    cols: Option<u16>,
+    // The journal entry of an agent an add-on started (the window passes the key it was told in the open event).
+    agent_key: Option<String>,
 ) -> Result<(), String> {
     let pty_system = portable_pty::native_pty_system();
     let size = PtySize {
@@ -185,6 +223,12 @@ pub fn pty_spawn(
         builder.cwd(dir);
     }
     builder.env("TERM", "xterm-256color");
+    // The terminal in the app is not the terminal the app was started from. Variables that name that outer
+    // terminal (a herdr or tmux pane, an Orca handle) would make agmsg in the child act on the outer pane: name it,
+    // rename it, and treat the agent as living there.
+    for name in outer_terminal_vars(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok())) {
+        builder.env_remove(name);
+    }
     // Explicitly set PATH from what import_login_shell_path() resolved at
     // startup (lib.rs) rather than relying on this child implicitly
     // inheriting the process's own (mutated) environment — a real
@@ -212,6 +256,7 @@ pub fn pty_spawn(
         .to_ascii_lowercase();
     let detection = Arc::new(Mutex::new(DetectionTracker::new(agent_type)));
 
+    let exit_key = agent_key.clone();
     // Reader thread: stream output to the webview.
     {
         let app = app.clone();
@@ -232,6 +277,11 @@ pub fn pty_spawn(
             }
             // Reap the child and notify the webview the pane is gone.
             let _ = child.wait();
+            if let Some(key) = &exit_key {
+                if let Some(m) = crate::addons::agents::global() {
+                    m.pty_ended(key);
+                }
+            }
             let _ = app.emit("pty-exit", ExitEvent { id: id.clone() });
         });
     }
@@ -240,6 +290,11 @@ pub fn pty_spawn(
         id,
         PtySession { master: pair.master, writer, pid, tail, detection },
     );
+    if let (Some(key), Some(pid)) = (&agent_key, pid) {
+        if let Some(m) = crate::addons::agents::global() {
+            m.pty_started(key, pid);
+        }
+    }
     Ok(())
 }
 
@@ -296,6 +351,95 @@ pub fn pty_kill(manager: State<'_, PtyManager>, id: String) -> Result<(), String
     Ok(())
 }
 
+/// Variables that mark the shell the app was started from as a Claude Code session, or name its terminal. A claude
+/// started in an app terminal that inherits them believes it is a child of that session: CLAUDE_CODE_CHILD_SESSION
+/// turns its transcript saving off, and the others tie it to the outer session's id, socket and token. User
+/// configuration (CLAUDE_CONFIG_DIR, API keys, model settings) is not listed and is passed through.
+const OUTER_SESSION_VARS: [&str; 11] = [
+    "TMUX",
+    "TMUX_PANE",
+    "ORCA_TERMINAL_HANDLE",
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_ENTRYPOINT",
+];
+
+/// The names, among `names`, that identify the terminal the app itself runs in.
+fn outer_terminal_vars(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    names.into_iter().filter(|n| n.starts_with("HERDR_") || OUTER_SESSION_VARS.contains(&n.as_str())).collect()
+}
+
+/// Write `bytes` and flush; either failing is an error.
+fn write_and_flush(w: &mut dyn Write, bytes: &[u8]) -> Result<(), String> {
+    w.write_all(bytes).and_then(|_| w.flush()).map_err(|e| format!("could not write to the terminal: {e}"))
+}
+
+/// One injection: under the pane's lock, write the text, wait `gap`, write Enter. Any write or flush error ends the
+/// transaction with that error, so a dead terminal is never reported as delivered.
+fn inject_transaction(
+    lock: &Mutex<()>,
+    gap: Duration,
+    text: &[u8],
+    mut write: impl FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    let _transaction = lock.lock().unwrap();
+    write(text)?;
+    thread::sleep(gap);
+    write(b"\r")
+}
+
+/// How long after the Enter the pane is looked at for the diagnostic line.
+const AFTER_ENTER_LOOK: Duration = Duration::from_millis(1500);
+
+/// A short-lived thread that looks at the pane once, `AFTER_ENTER_LOOK` after the Enter, and logs what it showed (see
+/// `after_enter_line`). It runs outside the injection, holds no pane lock and writes nothing to the pane, so it
+/// cannot change delivery. No process is started.
+fn log_after_enter(sessions: Arc<Mutex<HashMap<String, PtySession>>>, id: String, text: String) {
+    thread::spawn(move || {
+        thread::sleep(AFTER_ENTER_LOOK);
+        // Best effort: a lock somebody holds is tried a few times and then given up on, so this thread ends within
+        // a fixed time and never waits behind the registry or a pane's buffer.
+        let mut seen = None;
+        for attempt in 0..LOOK_ATTEMPTS {
+            if attempt > 0 {
+                thread::sleep(LOOK_RETRY_GAP);
+            }
+            if let Some(handles) = try_get(&sessions, &id, |s| (Arc::clone(&s.tail), Arc::clone(&s.detection))) {
+                seen = handles.and_then(|(tail, detection)| try_snapshot(&tail, &detection));
+                break;
+            }
+        }
+        match seen {
+            Some((agent_type, tail, lines)) => {
+                eprintln!("[agmsg-app] after Enter into {id}: {}", crate::agent_state::after_enter_line(&agent_type, &tail, &lines, &text));
+            }
+            None => eprintln!("[agmsg-app] after Enter into {id}: the pane was busy or gone, not looked at"),
+        }
+    });
+}
+
+const LOOK_ATTEMPTS: u32 = 4;
+const LOOK_RETRY_GAP: Duration = Duration::from_millis(50);
+
+/// `f` on the entry for `id`, without waiting: `None` when the map's lock is held (the caller tries again later),
+/// `Some(None)` when there is no such entry. The map's lock is let go before this returns.
+fn try_get<V, R>(map: &Mutex<HashMap<String, V>>, id: &str, f: impl FnOnce(&V) -> R) -> Option<Option<R>> {
+    let guard = map.try_lock().ok()?;
+    Some(guard.get(id).map(f))
+}
+
+/// What the log line needs from one pane, taken without waiting for either lock.
+fn try_snapshot(tail: &Mutex<TailBuffer>, detection: &Mutex<DetectionTracker>) -> Option<(String, String, Vec<String>)> {
+    let tail = tail.try_lock().ok()?;
+    let agent_type = detection.try_lock().ok()?.agent_type().to_string();
+    Some((agent_type, tail.detection_tail(), tail.last_lines(6)))
+}
+
 /// Inject `text` (then Enter) into the agent's stdin — the universal,
 /// agent-agnostic agmsg delivery. No idle wait before writing the text; see
 /// the module doc comment for why waiting for quiescence was worse than not
@@ -304,32 +448,173 @@ pub fn pty_kill(manager: State<'_, PtyManager>, id: String) -> Result<(), String
 /// paste (the trailing newline is swallowed as pasted content rather than
 /// submitting), so the Enter is held back a beat after the text — long
 /// enough that the agent's input parser has processed the text as typed
-/// input first. Runs on a background thread so the ~300ms gap doesn't block
-/// the Tauri command handler.
+/// input first. The gap runs on a blocking worker so it does not hold the
+/// Tauri command handler, and the command resolves only once the Enter has
+/// been written: the caller can serialise whole text+Enter transactions on
+/// one pane by waiting for it.
 #[tauri::command]
-pub fn pty_inject(manager: State<'_, PtyManager>, id: String, text: String) -> Result<(), String> {
-    // Fail fast, synchronously, if the pane is already gone.
+pub async fn pty_inject(manager: State<'_, PtyManager>, id: String, text: String) -> Result<(), String> {
+    // Fail fast if the pane is already gone.
     if !manager.sessions.lock().unwrap().contains_key(&id) {
         return Err("no such pty session".to_string());
     }
     let sessions = Arc::clone(&manager.sessions);
-    thread::spawn(move || {
-        if let Some(s) = sessions.lock().unwrap().get_mut(&id) {
-            let _ = s.writer.write_all(text.as_bytes());
-            let _ = s.writer.flush();
+    let lock = pane_lock(&manager.inject_locks, &id);
+    tauri::async_runtime::spawn_blocking(move || {
+        let sent = inject_transaction(&lock, Duration::from_millis(300), text.as_bytes(), |bytes| {
+            match sessions.lock().unwrap().get_mut(&id) {
+                Some(s) => write_and_flush(&mut s.writer, bytes),
+                None => Err("no such pty session".to_string()),
+            }
+        });
+        if sent.is_ok() {
+            log_after_enter(sessions, id, text);
         }
-        thread::sleep(Duration::from_millis(300));
-        if let Some(s) = sessions.lock().unwrap().get_mut(&id) {
-            let _ = s.writer.write_all(b"\r");
-            let _ = s.writer.flush();
-        }
-    });
-    Ok(())
+        sent
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn variables_of_the_outer_terminal_are_not_passed_to_the_child() {
+        let names = ["PATH", "HOME", "HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_ENV", "TMUX", "TMUX_PANE", "ORCA_TERMINAL_HANDLE", "TMUXINATOR", "TERM", "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "ANTHROPIC_API_KEY"];
+        let got = super::outer_terminal_vars(names.iter().map(|s| s.to_string()));
+        assert_eq!(got, vec!["HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_ENV", "TMUX", "TMUX_PANE", "ORCA_TERMINAL_HANDLE", "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_ENTRYPOINT"]);
+    }
+
     use super::windows_shell_argv;
+
+    #[test]
+    fn the_look_after_an_enter_never_waits_for_a_lock_somebody_holds() {
+        use super::{try_get, try_snapshot};
+        use crate::agent_state::{DetectionTracker, TailBuffer};
+        use std::sync::{Arc, Mutex};
+        let map: Mutex<std::collections::HashMap<String, u8>> = Mutex::new([("p".to_string(), 7u8)].into_iter().collect());
+        assert_eq!(try_get(&map, "p", |v| *v), Some(Some(7)));
+        assert_eq!(try_get(&map, "gone", |v| *v), Some(None), "no such pane is an answer, not a wait");
+        let held = map.lock().unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(try_get(&map, "p", |v| *v), None, "a held registry is reported at once");
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        drop(held);
+
+        let tail = Arc::new(Mutex::new(TailBuffer::default()));
+        let detection = Arc::new(Mutex::new(DetectionTracker::new("codex".into())));
+        assert!(try_snapshot(&tail, &detection).is_some());
+        let held_tail = tail.lock().unwrap();
+        assert!(try_snapshot(&tail, &detection).is_none(), "a held buffer is not waited for");
+        drop(held_tail);
+        let held_detection = detection.lock().unwrap();
+        assert!(try_snapshot(&tail, &detection).is_none(), "a held tracker is not waited for");
+        drop(held_detection);
+        assert!(try_snapshot(&tail, &detection).is_some());
+    }
+
+    #[test]
+    fn the_registry_is_not_held_while_the_pane_buffers_are_read() {
+        use super::try_get;
+        use std::sync::{Arc, Mutex};
+        let map: Mutex<std::collections::HashMap<String, Arc<Mutex<u8>>>> = Mutex::new([("p".to_string(), Arc::new(Mutex::new(1u8)))].into_iter().collect());
+        let handle = try_get(&map, "p", Arc::clone).unwrap().unwrap();
+        // the registry can be taken (a pane opened or closed) while the inner lock is still in use
+        let inner = handle.lock().unwrap();
+        assert!(map.try_lock().is_ok(), "the registry lock was let go");
+        drop(inner);
+    }
+
+    #[test]
+    fn two_injections_into_one_pane_never_interleave_even_when_the_first_is_slow() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        let locks: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>> = Default::default();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let run = |text: &'static str, gap_ms: u64| {
+            let lock = super::pane_lock(&locks, "p1");
+            let log = Arc::clone(&log);
+            move || {
+                super::inject_transaction(&lock, Duration::from_millis(gap_ms), text.as_bytes(), |b| {
+                    log.lock().unwrap().push(String::from_utf8_lossy(b).into_owned());
+                    Ok(())
+                })
+                .unwrap()
+            }
+        };
+        // The first writer's gap (700 ms) is longer than any settle delay the caller uses.
+        let a = std::thread::spawn(run("text1", 700));
+        std::thread::sleep(Duration::from_millis(50));
+        let b = std::thread::spawn(run("text2", 10));
+        a.join().unwrap();
+        b.join().unwrap();
+        assert_eq!(*log.lock().unwrap(), vec!["text1", "\r", "text2", "\r"]);
+    }
+
+    /// A terminal whose writes are accepted but whose flushes fail from the `fail_from`-th flush on.
+    struct FlushFails {
+        flushes: usize,
+        fail_from: usize,
+        written: Vec<u8>,
+    }
+    impl std::io::Write for FlushFails {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            if self.flushes >= self.fail_from {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe closed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn a_flush_error_alone_fails_the_injection_for_the_text_and_for_the_enter() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+        let lock = Mutex::new(());
+        // Only the text's flush fails: Err, and the Enter is never written.
+        let mut w = FlushFails { flushes: 0, fail_from: 1, written: vec![] };
+        let r = super::inject_transaction(&lock, Duration::ZERO, b"hi", |b| super::write_and_flush(&mut w, b));
+        assert!(r.unwrap_err().contains("pipe closed"));
+        assert_eq!(w.written, b"hi");
+        // The text's flush works, only the Enter's fails.
+        let mut w = FlushFails { flushes: 0, fail_from: 2, written: vec![] };
+        let r = super::inject_transaction(&lock, Duration::ZERO, b"hi", |b| super::write_and_flush(&mut w, b));
+        assert!(r.unwrap_err().contains("pipe closed"));
+        assert_eq!(w.written, b"hi\r");
+        // Nothing failing: Ok.
+        let mut w = FlushFails { flushes: 0, fail_from: usize::MAX, written: vec![] };
+        assert!(super::inject_transaction(&lock, Duration::ZERO, b"hi", |b| super::write_and_flush(&mut w, b)).is_ok());
+    }
+
+    #[test]
+    fn a_failed_text_or_enter_write_fails_the_injection() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+        let lock = Mutex::new(());
+        // Text write fails: Err, and Enter is never attempted.
+        let mut calls = 0;
+        let r = super::inject_transaction(&lock, Duration::ZERO, b"x", |_| {
+            calls += 1;
+            Err("broken pipe".to_string())
+        });
+        assert_eq!(r, Err("broken pipe".to_string()));
+        assert_eq!(calls, 1);
+        // Text goes through, the Enter write fails: still Err.
+        let mut n = 0;
+        let r = super::inject_transaction(&lock, Duration::ZERO, b"x", |_| {
+            n += 1;
+            if n == 2 { Err("flush failed".to_string()) } else { Ok(()) }
+        });
+        assert_eq!(r, Err("flush failed".to_string()));
+        // The lock is released after a failure.
+        assert!(lock.try_lock().is_ok());
+    }
 
     #[test]
     fn wraps_the_agent_name_through_cmd_slash_c() {
@@ -350,6 +635,36 @@ mod tests {
     #[test]
     fn wraps_an_argless_launch() {
         assert_eq!(windows_shell_argv("codex", &[]), vec!["/d", "/c", "codex"]);
+    }
+
+    // The real launch path on Windows (cmd /d /c through a pty, as pty_spawn_inner builds it) must hand the startup
+    // prompt to the program byte for byte. A tiny PowerShell script is the argv dumper.
+    #[cfg(windows)]
+    #[test]
+    fn the_startup_prompt_reaches_a_program_unchanged_through_cmd() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("dump.ps1");
+        let out = dir.path().join("arg.txt");
+        std::fs::write(&script, "[System.IO.File]::WriteAllText($env:DUMP_OUT, $args[0])").unwrap();
+        let prompt = "/agmsg actas white and then read your inbox with: bash ~/.agents/skills/agmsg/scripts/inbox.sh chess white and act on what is waiting, reply with: bash ~/.agents/skills/agmsg/scripts/send.sh chess white SENDER followed by your reply, a reply written in this chat is not delivered".to_string();
+        let args = vec!["-NoProfile".to_string(), "-File".to_string(), script.to_string_lossy().into_owned(), prompt.clone()];
+        let pair = native_pty_system().openpty(PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 }).unwrap();
+        let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+        let mut b = CommandBuilder::new(comspec);
+        for a in windows_shell_argv("powershell", &args) {
+            b.arg(a);
+        }
+        b.env("DUMP_OUT", out.to_string_lossy().into_owned());
+        let mut child = pair.slave.spawn_command(b).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        std::thread::spawn(move || {
+            let mut sink = [0u8; 4096];
+            while matches!(std::io::Read::read(&mut reader, &mut sink), Ok(n) if n > 0) {}
+        });
+        child.wait().unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), prompt);
     }
 
     // resolve_windows_cwd is behind cfg(windows); this test runs on the

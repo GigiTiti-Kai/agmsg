@@ -36,6 +36,8 @@ export interface PaneRelay {
   onPush(p: PushEvent): void;
   /** Closes the current port (revoke, remove, unmount). A later onFrameLoad starts a new generation. */
   closePort(): void;
+  /** Tell the open port the app's language changed. Nothing is sent when no port is open (the next load reads the current one). */
+  onLocaleChange(locale: string): void;
   /** The generation the open port is bound to, or null. */
   generation(): number | null;
 }
@@ -59,6 +61,15 @@ const isRequest = (d: unknown): d is { agmsg: 1; type: "request"; id: number; op
   return r.agmsg === 1 && r.type === "request" && typeof r.id === "number" && Number.isFinite(r.id) && typeof r.op === "string";
 };
 
+const isErrorReport = (d: unknown): d is { agmsg: 1; type: "error"; message: string; stack?: string } => {
+  if (typeof d !== "object" || d === null) return false;
+  const r = d as Record<string, unknown>;
+  return r.agmsg === 1 && r.type === "error" && typeof r.message === "string" && (r.stack === undefined || typeof r.stack === "string");
+};
+
+/** The one thing the add-on is told about the app's language: the tag, nothing else. */
+export const localeEvent = (locale: string) => ({ agmsg: 1, type: "locale", locale });
+
 function errorResponse(message: string): BrokerResponse {
   return { agmsg: 1, type: "response", ok: false, error: { code: "error", message } };
 }
@@ -69,6 +80,8 @@ export function createPaneRelay(deps: {
   frameWindow: () => FrameWindowLike | null;
   /** True when the pane declares messages:read, so `init` is fed after the port is handed over. */
   wantsFeed: boolean;
+  /** The app's current language tag (one of its supported languages), read at each load. */
+  getLocale?: () => string;
   newChannel?: () => ChannelLike;
   /** Called when a broker op is refused, so the header can show "blocked: …" briefly. */
   onRefused?: (op: string, code: string) => void;
@@ -120,10 +133,19 @@ export function createPaneRelay(deps: {
       const mine: Bound = { generation, port: channel.port1, state: deps.wantsFeed ? "initializing" : "live", buffered: [] };
       bound = mine;
       mine.port.onmessage = (e) => {
-        if (bound !== mine || !isRequest(e.data)) return;
+        if (bound !== mine) return;
+        if (isErrorReport(e.data)) {
+          // An error the page caught: Rust writes it to the app's log (cut and rate-limited there).
+          void deps.invoke("addon_pane_error", { id: deps.id, generation: mine.generation, message: e.data.message, stack: e.data.stack ?? null }).catch(() => {});
+          return;
+        }
+        if (!isRequest(e.data)) return;
         void handleRequest(mine, e.data);
       };
       win.postMessage({ agmsg: 1, type: "port" }, "*", [channel.port2 as Transferable]);
+      // The language goes to every pane, with or without the messages permission, before anything else.
+      const locale = deps.getLocale?.();
+      if (locale) mine.port.postMessage(localeEvent(locale));
       if (!deps.wantsFeed) return;
       try {
         const feed = (await deps.invoke("addon_feed_init", { id: deps.id, generation })) as { init: unknown; queued: unknown[] };
@@ -162,6 +184,9 @@ export function createPaneRelay(deps: {
           mine.state = "live";
         }
       }
+    },
+    onLocaleChange(locale) {
+      if (bound && locale) bound.port.postMessage(localeEvent(locale));
     },
     onPush(p) {
       if (!bound || p.pane !== deps.id || p.generation !== bound.generation) return;

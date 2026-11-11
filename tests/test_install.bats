@@ -4,6 +4,8 @@
 # the packaged artifact (not a hand-built tree like test_helper builds) is what
 # gets validated. Catches packaging drift — e.g. a new scripts/lib/ helper that
 # the installer forgets to copy, which would make every command die at `source`.
+# Tests that only need an install to start from use a copy of one built for
+# real once per file (_restore_install below).
 
 load test_helper  # for setup_live_owner
 
@@ -25,6 +27,15 @@ setup() {
   # tests below that intentionally leave a background process running past
   # their next assertion populate this; harmless (stays empty) elsewhere.
   WATCHED_PIDS=""
+}
+
+# The real directory the state of an install lives in (Codex writable_roots name
+# real paths: a sandbox checks where a write resolves to). $1 = optional part,
+# $2 = install name.
+state_path() {
+  local d="$FAKE_HOME/.agmsg/${2:-agmsg}"
+  d="$(cd -P "$d" 2>/dev/null && pwd -P)" || d="$FAKE_HOME/.agmsg/${2:-agmsg}"
+  printf '%s%s\n' "$d" "${1:+/$1}"
 }
 
 # Register <pid> for teardown, together with a substring that MUST appear in
@@ -98,6 +109,81 @@ teardown() {
   return "$rc"
 }
 
+# Put the result of a real `install.sh [args]` into $FAKE_HOME without running
+# the installer again for every test that only needs an install to exist.
+#
+# 65 tests below start from one of a few installs as arrange-only work, and a
+# fresh install costs about 3 s on macOS and 1 s on ubuntu (locally the whole
+# file went from 388 s to 300 s once the repeats were gone). The first test that
+# asks for a given install builds it for real -- from this tree, with that
+# test's environment, into an empty HOME under $BATS_FILE_TMPDIR -- and later
+# tests copy that tree, so what they assert on is still the real installer's
+# output. Tests about what install.sh prints, and test 1 (the fresh-install
+# smoke test), still run it themselves.
+#
+#   --marker <dir>  create $HOME/<dir> before installing, as the tests for the
+#                   per-agent skills do (the marker is part of the copy).
+#
+# A copy is only equivalent if nothing in it points back at the template. An
+# install writes its own HOME path into exactly three text files: the launcher
+# (~/.local/bin/<cmd>), the Antigravity shim (~/.agents/bin/agy-tui) and
+# run/agmsg-launcher.path. Only those are rewritten. The final check looks for
+# the template directory's name anywhere in the copy -- any file, any quoting
+# -- so an installer that starts writing its path somewhere else turns the test
+# red instead of letting it act on the template (add the new file to the list
+# once it is understood). Paths that need shell quoting (the installer writes
+# some through printf %q) and Windows (Git Bash writes another path form)
+# install for real every time.
+_restore_install() {   # [--marker <dir>] [install.sh args...]; default args: --cmd agmsg
+  local marker="" cmd=agmsg prev="" a copy=1 key ref tmp src f esc
+  if [ "${1:-}" = "--marker" ]; then
+    marker="$2"
+    shift 2
+  fi
+  [ "$#" -gt 0 ] || set -- --cmd agmsg
+  for a in "$@"; do
+    [ "$prev" = "--cmd" ] && cmd="$a"
+    prev="$a"
+  done
+  case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) copy=0 ;; esac
+  [ "$(printf '%q' "$FAKE_HOME")" = "$FAKE_HOME" ] || copy=0
+  [ "$(printf '%q' "$BATS_FILE_TMPDIR")" = "$BATS_FILE_TMPDIR" ] || copy=0
+  if [ "$copy" -eq 0 ]; then
+    if [ -n "$marker" ]; then mkdir -p "$FAKE_HOME/$marker" || return 1; fi
+    HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" "$@"
+    return
+  fi
+  key="$(printf '%s_' "$marker" "$@" | tr -c 'A-Za-z0-9_' '_')"
+  ref="$BATS_FILE_TMPDIR/install-template-$key"
+  if [ ! -s "$ref" ]; then
+    src="$(mktemp -d "$BATS_FILE_TMPDIR/install-template.XXXXXX")" || return 1
+    if [ -n "$marker" ]; then mkdir -p "$src/$marker" || return 1; fi
+    HOME="$src" bash "$REPO_ROOT/install.sh" "$@" || return 1
+    # Published by rename, so a test running in parallel (bats --jobs) never
+    # reads a half-written path.
+    tmp="$(mktemp "$ref.XXXXXX")" || return 1
+    printf '%s\n' "$src" > "$tmp" || return 1
+    mv -f "$tmp" "$ref" || return 1
+  fi
+  src="$(cat "$ref")"
+  [ -n "$src" ] && [ -d "$src/.agents/skills/$cmd" ] || return 1
+  cp -Rp "$src/." "$FAKE_HOME/" || return 1
+  esc="$(printf '%s' "$src" | sed 's/[][\.*^$|]/\\&/g')"
+  # The state parts are links to <template>/.agmsg/<cmd>/<part>; point them at the copy.
+  for f in run db teams ext-tools .trash; do
+    [ -L "$FAKE_HOME/.agents/skills/$cmd/$f" ] || continue
+    ln -sfn "$FAKE_HOME/.agmsg/$cmd/$f" "$FAKE_HOME/.agents/skills/$cmd/$f" || return 1
+  done
+  for f in ".local/bin/$cmd" .agents/bin/agy-tui ".agents/skills/$cmd/run/agmsg-launcher.path" \
+           ".agents/skills/$cmd/.agmsg" ".agmsg/$cmd/.owner"; do
+    [ -f "$FAKE_HOME/$f" ] || continue
+    # cat into the existing file keeps its mode (the launcher is 0711).
+    sed "s|$esc|$FAKE_HOME|g" "$FAKE_HOME/$f" > "$BATS_TEST_TMPDIR/restore-rewrite" || return 1
+    cat "$BATS_TEST_TMPDIR/restore-rewrite" > "$FAKE_HOME/$f" || return 1
+  done
+  refute grep -rqF -- "${src##*/}" "$FAKE_HOME"
+}
+
 @test "install: fresh install ships scripts/lib and the commands actually run" {
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
   [ -f "$SK/scripts/lib/storage.sh" ]
@@ -121,7 +207,7 @@ teardown() {
 }
 
 @test "install: --update refreshes an owned Antigravity TUI shim but prints no line about it (#1815)" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   local shim="$FAKE_HOME/.agents/bin/agy-tui"
   local before; before="$(cat "$shim")"
 
@@ -206,7 +292,7 @@ _agy_failing_mv_fixture() {
 }
 
 @test "install --update: a failing Antigravity shim step warns once, and the Codex shim is still refreshed" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
   local shim="$FAKE_HOME/.agents/bin/codex" tmp; tmp="$BATS_TEST_TMPDIR/codex-shim.stale"
   sed 's#/scripts/drivers/types/codex/#/scripts/codex/#g' "$shim" > "$tmp"
@@ -224,8 +310,92 @@ _agy_failing_mv_fixture() {
   grep -q '/scripts/drivers/types/codex/codex-shim.sh' "$shim"
 }
 
+# A stand-in for a running agmsgd: listens on a socket recorded in install.db,
+# and on a stop request (obeying it unless told to hang) notes whether the
+# installed scripts were still the old ones, marks the owner "none" and exits.
+_fake_agmsgd() {   # <obey|hang>
+  local sock="$FAKE_HOME/d.sock" db="$SK/run/install.db"
+  rm -f "$sock"
+  node -e '
+    const net = require("node:net"); const fs = require("node:fs");
+    const { DatabaseSync } = require("node:sqlite");
+    const [sock, db, mode, marker, log] = process.argv.slice(1);
+    net.createServer((c) => { let b = "";
+      c.on("data", (d) => { b += d; if (!b.includes("\"stop\"")) return;
+        fs.appendFileSync(log, fs.readFileSync(marker, "utf8").includes("OLD-SCRIPT") ? "stop-before-swap\n" : "stop-after-swap\n");
+        if (mode === "obey") { const x = new DatabaseSync(db); x.exec("PRAGMA busy_timeout=5000"); x.prepare("UPDATE daemon_owner SET state=?, socket=NULL, executor_pid=NULL").run("none"); x.close(); process.exit(0); }
+      });
+    }).listen(sock, () => fs.writeFileSync(log + ".up", "1"));
+  ' "$sock" "$db" "$1" "$SK/scripts/daemon.sh" "$FAKE_HOME/fake.log" &
+  FAKE_PID=$!
+  _agmsg_watch_pid "$FAKE_PID" "$sock"
+  local i=0
+  while [ ! -e "$FAKE_HOME/fake.log.up" ] && [ "$i" -lt 100 ]; do i=$((i + 1)); sleep 0.1; done
+  sqlite3 "$db" "UPDATE daemon_intent SET desired='on'; UPDATE meta SET node_path='$(command -v node)'; UPDATE daemon_owner SET state='ready', socket='$sock', executor_pid=$FAKE_PID;"
+}
+
+@test "install --update: a running agmsgd is stopped, and gone, before any script is replaced" {
+  _restore_install
+  printf '\n# OLD-SCRIPT\n' >> "$SK/scripts/daemon.sh"
+  _fake_agmsgd obey
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --update
+  [ "$status" -eq 0 ]
+  grep -Fq "agmsgd stopped before the update (exit confirmed)" <<<"$output"
+  [ "$(cat "$FAKE_HOME/fake.log")" = "stop-before-swap" ]
+  refute grep -q "OLD-SCRIPT" "$SK/scripts/daemon.sh"
+  [ "$(sqlite3 "$SK/run/install.db" 'SELECT desired FROM daemon_intent;')" = on ]
+}
+
+@test "install --update: an agmsgd that does not exit within the bound is reported, and the update still finishes" {
+  _restore_install
+  _fake_agmsgd hang
+  run env HOME="$FAKE_HOME" AGMSG_UPDATE_STOP_WAIT=2 bash "$REPO_ROOT/install.sh" --cmd agmsg --update
+  [ "$status" -eq 0 ]
+  grep -Fq "agmsgd has not exited after about 2s; the update goes on" <<<"$output"
+  grep -Fq "daemon stop, then daemon start" <<<"$output"
+  grep -Fq "Update complete" <<<"$output"
+}
+
+@test "install --update: a record that says ready for a process that is gone does not hold the update" {
+  _restore_install
+  sqlite3 "$SK/run/install.db" "UPDATE daemon_intent SET desired='on'; UPDATE daemon_owner SET state='ready', socket='$FAKE_HOME/none.sock', executor_pid=999999;"
+  run env HOME="$FAKE_HOME" AGMSG_UPDATE_STOP_WAIT=20 bash "$REPO_ROOT/install.sh" --cmd agmsg --update
+  [ "$status" -eq 0 ]
+  grep -Fq "agmsgd stopped before the update (exit confirmed)" <<<"$output"
+}
+
+# A process that exists but cannot be signalled must not be taken for one that
+# has exited: only "No such process" counts. The shell function stands in for
+# the builtin, as the extracted-function harnesses above do.
+_pid_gone_harness() {   # <kill message>
+  local fn; fn="$(sed -n '/^agmsg_install_pid_gone() {/,/^}/p' "$REPO_ROOT/install.sh")"
+  bash -c '
+    kill() { echo "$KILL_MSG" >&2; return 1; }
+    eval "$1"
+    agmsg_install_pid_gone 4242
+  ' _ "$fn"
+}
+
+@test "install --update: a pid that cannot be signalled (permission denied) is not treated as exited" {
+  KILL_MSG="kill: (4242) - Operation not permitted" run _pid_gone_harness
+  [ "$status" -eq 1 ]
+}
+
+@test "install --update: only 'No such process' means the executor is gone" {
+  KILL_MSG="kill: (4242) - No such process" run _pid_gone_harness
+  [ "$status" -eq 0 ]
+}
+
+@test "install --update: with no agmsgd running nothing about stopping is printed" {
+  _restore_install
+  run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --update
+  [ "$status" -eq 0 ]
+  refute grep -Fq "agmsgd stopped before the update" <(printf '%s' "$output")
+  refute grep -Fq "agmsgd has not exited" <(printf '%s' "$output")
+}
+
 @test "install --update: an owned Codex shim is removed while agmsgd is on, and put back once it is off" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
   local shim="$FAKE_HOME/.agents/bin/codex"
   [ -x "$shim" ]
@@ -244,7 +414,7 @@ _agy_failing_mv_fixture() {
 }
 
 @test "install --update: a Codex shim that cannot be put back is reported with the command to repeat, and the update still finishes" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
   sqlite3 "$SK/run/install.db" "UPDATE daemon_intent SET desired='on';"
   run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --update
@@ -264,7 +434,7 @@ _agy_failing_mv_fixture() {
 }
 
 @test "install --update: with agmsgd off an owned Codex shim is refreshed as before" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
   local shim="$FAKE_HOME/.agents/bin/codex"
   sed 's#/scripts/drivers/types/codex/#/scripts/codex/#g' "$shim" > "$BATS_TEST_TMPDIR/stale"
@@ -289,7 +459,7 @@ _agy_failing_mv_fixture() {
 
 @test "install: Antigravity TUI shim resolves installed launcher and forwards actions first" {
   skip_unless_linux
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   local shim="$FAKE_HOME/.agents/bin/agy-tui"
   [ -x "$shim" ]
   grep -Fq "# agmsg-shim-owner: $SK/scripts/drivers/types/antigravity/agy-tui.sh" "$shim"
@@ -339,7 +509,7 @@ _agy_failing_mv_fixture() {
 }
 
 @test "install: a second install's Antigravity TUI shim left owned by the first prints no line about it (#1815)" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   local shim="$FAKE_HOME/.agents/bin/agy-tui"
   local before; before="$(cat "$shim")"
   grep -Fq "# agmsg-shim-owner: $SK/scripts/drivers/types/antigravity/agy-tui.sh" "$shim"
@@ -351,7 +521,7 @@ _agy_failing_mv_fixture() {
 }
 
 @test "install: Antigravity TUI shim replaces its symlink without writing through it" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   local shim="$FAKE_HOME/.agents/bin/agy-tui"
   local linked="$FAKE_HOME/linked-agy-tui"
   cp "$shim" "$linked"
@@ -366,7 +536,7 @@ _agy_failing_mv_fixture() {
 
 @test "install: Antigravity TUI launcher resolves one registered identity" {
   skip_unless_linux
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   local project="$FAKE_HOME/project"
   local fake_agy="$FAKE_HOME/bin/agy"
   mkdir -p "$project" "$(dirname "$fake_agy")"
@@ -381,7 +551,7 @@ _agy_failing_mv_fixture() {
 }
 
 @test "uninstall: removes only the owned Antigravity TUI shim" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   local shim="$FAKE_HOME/.agents/bin/agy-tui"
   [ -f "$shim" ]
 
@@ -464,10 +634,10 @@ _agy_failing_mv_fixture() {
   [ -f "$proj_cmd_second" ]
   grep -qF "$SK/" "$settings"
   grep -qF "$sk_second/" "$settings"
-  refute grep -qF "$SK/" "$FAKE_HOME/.codex/config.toml"
-  refute grep -qF "$sk_second/" "$FAKE_HOME/.codex/config.toml"
-  grep -qF "$SK/" "$codex_home2/config.toml"
-  grep -qF "$sk_second/" "$codex_home2/config.toml"
+  refute grep -qF "/.agmsg/agmsg/" "$FAKE_HOME/.codex/config.toml"
+  refute grep -qF "/.agmsg/agmsg-second/" "$FAKE_HOME/.codex/config.toml"
+  grep -qF "/.agmsg/agmsg/" "$codex_home2/config.toml"
+  grep -qF "/.agmsg/agmsg-second/" "$codex_home2/config.toml"
   [ -f "$opencode_first" ]
   [ -f "$opencode_second" ]
   [ -f "$hermes_first" ]
@@ -483,17 +653,17 @@ _agy_failing_mv_fixture() {
   # install this run is about (#1400).
   HOME="$FAKE_HOME" CODEX_HOME="$codex_home2" bash "$SK/uninstall.sh" --yes
 
-  # $SK itself is no longer fully gone: run/install-op.lock.db
+  # $SK itself is no longer fully gone: .install-op/lock.db
   # is kept on purpose, so a residual $SK/run/ survives. Its substantive
   # content is what must be gone -- covered in full by its own test
-  # ("uninstall keeps run/install-op.lock.db while removing everything else").
+  # ("uninstall keeps .install-op/lock.db while removing everything else").
   [ ! -e "$SK/scripts" ]
   [ ! -e "$SK/SKILL.md" ]
   [ ! -f "$cmd_first" ]
   [ ! -f "$proj_cmd_first" ]
   refute grep -qF "$SK/" "$settings"
-  refute grep -qF "$SK/" "$FAKE_HOME/.codex/config.toml"
-  refute grep -qF "$SK/" "$codex_home2/config.toml"
+  refute grep -qF "/.agmsg/agmsg/" "$FAKE_HOME/.codex/config.toml"
+  refute grep -qF "/.agmsg/agmsg/" "$codex_home2/config.toml"
   [ ! -e "$opencode_first" ]
   [ ! -e "$hermes_first" ]
   [ ! -e "$grok_first" ]
@@ -505,8 +675,8 @@ _agy_failing_mv_fixture() {
   [ -f "$cmd_second" ]
   [ -f "$proj_cmd_second" ]
   grep -qF "$sk_second/" "$settings"
-  refute grep -qF "$sk_second/" "$FAKE_HOME/.codex/config.toml"
-  grep -qF "$sk_second/" "$codex_home2/config.toml"
+  refute grep -qF "/.agmsg/agmsg-second/" "$FAKE_HOME/.codex/config.toml"
+  grep -qF "/.agmsg/agmsg-second/" "$codex_home2/config.toml"
   [ -f "$opencode_second" ]
   [ -f "$hermes_second" ]
   [ -f "$grok_second" ]
@@ -533,8 +703,8 @@ _agy_failing_mv_fixture() {
   printf 'model = "gpt-test"\n' > "$FAKE_HOME/.codex/config.toml"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd third-second
   local sk_third_second="$FAKE_HOME/.agents/skills/third-second"
-  grep -qF "$sk_third_second/" "$FAKE_HOME/.codex/config.toml"
-  refute grep -qF "$sk_third/" "$FAKE_HOME/.codex/config.toml"
+  grep -qF "/.agmsg/$(basename "$sk_third_second")/" "$FAKE_HOME/.codex/config.toml"
+  refute grep -qF "/.agmsg/$(basename "$sk_third")/" "$FAKE_HOME/.codex/config.toml"
 
   # install.sh's own codex-config step makes its own .bak when it added
   # third-second's entry above -- clear it too, so the check below is only
@@ -564,7 +734,7 @@ _agy_failing_mv_fixture() {
   # two installs present and no single one identified.
   HOME="$FAKE_HOME" bash "$REPO_ROOT/uninstall.sh" --all --yes
 
-  # Neither install is fully gone: run/install-op.lock.db
+  # Neither install is fully gone: .install-op/lock.db
   # is kept on purpose for each. Substantive content is what must be gone.
   [ ! -e "$FAKE_HOME/.agents/skills/agmsg/scripts" ]
   [ ! -e "$FAKE_HOME/.agents/skills/agmsg-second/scripts" ]
@@ -581,7 +751,7 @@ _agy_failing_mv_fixture() {
 }
 
 @test "install: --update restores scripts/lib even if it went missing" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   bash "$SK/scripts/join.sh" demo alice claude-code /tmp/install-update-projA
   bash "$SK/scripts/join.sh" demo bob   claude-code /tmp/install-update-projB
   rm -rf "$SK/scripts/lib"
@@ -592,7 +762,7 @@ _agy_failing_mv_fixture() {
 }
 
 @test "install: --update starts an agmsgd that was turned on again, instead of leaving it stopped" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   sqlite3 "$SK/run/install.db" "UPDATE meta SET node_path = '$(command -v node)'; UPDATE daemon_intent SET desired = 'on';"
   [ "$(sqlite3 "$SK/run/install.db" "SELECT state FROM daemon_owner;")" = "none" ]
   HOME="$FAKE_HOME" run bash "$REPO_ROOT/install.sh" --update
@@ -604,16 +774,326 @@ _agy_failing_mv_fixture() {
   [ "$owner_state" = "ready" ]
 }
 
+@test "install: --update clears a down_notice left by an earlier failed restart once the daemon comes back (decision 11-04, S01/S14)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  sqlite3 "$SK/run/install.db" "UPDATE meta SET node_path = '$(command -v node)'; UPDATE daemon_intent SET desired = 'on';"
+  # Simulate a down_notice left behind by an earlier failed restart attempt.
+  ( . "$SK/scripts/lib/down-notice.sh" && down_notice_set agmsgd down stale stale )
+  [ -f "$SK/run/down/agmsgd.json" ]
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
+  # Stop before any assertion below can fail, same ordering the existing
+  # "starts an agmsgd that was turned on again" test above uses -- a
+  # failed assertion must not leave a real background daemon running
+  # past this test.
+  bash "$SK/scripts/daemon.sh" stop || true
+  [ ! -f "$SK/run/down/agmsgd.json" ]
+}
+
+@test "install: --update records a down_notice when its one restart attempt fails, instead of only a terminal line (decision 11-04, S01/S14)" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  sqlite3 "$SK/run/install.db" "UPDATE meta SET node_path = '$(command -v node)'; UPDATE daemon_intent SET desired = 'on';"
+  # _resolve_node tries the recorded node_path, then AGMSG_NODE, then
+  # whatever agmsg_resolve_node() returns as a last resort -- but that last
+  # resort itself treats AGMSG_NODE as authoritative and returns it
+  # verbatim ahead of a real PATH lookup (lib/node.sh), so setting
+  # AGMSG_NODE poisons BOTH of those slots, and setting node_path poisons
+  # the first -- all three candidates collapse to the same bad value, so
+  # the installer's single restart attempt fails too -- exactly the
+  # S01/S14 gap: the daemon stays down and, before this fix, that was
+  # reported ONLY as a line in this run's own stderr.
+  sqlite3 "$SK/run/install.db" "UPDATE meta SET node_path = '/no/such/node';"
+  HOME="$FAKE_HOME" AGMSG_NODE=/no/such/node run bash "$REPO_ROOT/install.sh" --update
+  [ "$status" -eq 0 ]
+  [ "${output#*did not start after the update}" != "$output" ]
+  [ -f "$SK/run/down/agmsgd.json" ]
+  grep -q '"component":"agmsgd"' "$SK/run/down/agmsgd.json"
+  grep -q '"state":"down"' "$SK/run/down/agmsgd.json"
+  # The recovery command is single-quoted (so it survives a space in the
+  # install path, review round 3), so the literal substring "agmsg daemon
+  # start" never appears -- the quote closes right after "agmsg". Check
+  # the pieces that DO always appear instead.
+  grep -qF "$SK/scripts/agmsg' daemon start" "$SK/run/down/agmsgd.json"
+}
+
+_install_fns() {
+  local fns="$BATS_TEST_TMPDIR/install-fns.sh"
+  awk '/^# --- Defaults ---/ {exit} {print}' "$REPO_ROOT/install.sh" > "$fns"
+  printf '%s' "$fns"
+}
+
+@test "agmsg_install_restart_daemon: a restart that hits lock contention is retried once; op_gen is reused unchanged (decision 11-04, S01/S14 scope ruling)" {
+  local fns fake="$FAKE_HOME/fake-skill"
+  mkdir -p "$fake/run" "$fake/scripts"
+  sqlite3 "$fake/run/install.db" "CREATE TABLE daemon_intent(desired TEXT, op_gen INT); INSERT INTO daemon_intent VALUES('on',7); CREATE TABLE daemon_owner(state TEXT); INSERT INTO daemon_owner VALUES('none');"
+  fns="$(_install_fns)"
+  cat > "$fake/scripts/daemon.sh" <<EOF
+#!/usr/bin/env bash
+tries_file="$fake/tries"
+n=0
+[ -f "\$tries_file" ] && n="\$(cat "\$tries_file")"
+n=\$((n + 1))
+printf '%s\n' "\$n" > "\$tries_file"
+printf '%s\n' "\$*" >> "$fake/argv-log"
+if [ "\$n" = 1 ]; then
+  echo "agmsg daemon: could not acquire the install operation lock (another agmsg install or daemon command holds it). Nothing was changed; try again in a moment." >&2
+  exit 1
+fi
+echo "agmsg daemon start: running"
+exit 0
+EOF
+  chmod +x "$fake/scripts/daemon.sh"
+  run bash -c 'set -u; source "$1"; agmsg_install_restart_daemon "$2"' _ "$fns" "$fake"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$fake/tries")" = 2 ]
+  grep -qx 'start --only-if-op-gen 7' "$fake/argv-log"
+  [ "$(sort -u "$fake/argv-log" | wc -l | tr -d ' ')" = 1 ]
+  [ "${output#*trying once more}" != "$output" ]
+  [ ! -f "$fake/run/down/agmsgd.json" ]
+}
+
+@test "agmsg_install_restart_daemon: a permanent failure (no usable Node) is NOT retried" {
+  local fns fake="$FAKE_HOME/fake-skill2"
+  mkdir -p "$fake/run" "$fake/scripts"
+  sqlite3 "$fake/run/install.db" "CREATE TABLE daemon_intent(desired TEXT, op_gen INT); INSERT INTO daemon_intent VALUES('on',3); CREATE TABLE daemon_owner(state TEXT); INSERT INTO daemon_owner VALUES('none');"
+  fns="$(_install_fns)"
+  cat > "$fake/scripts/daemon.sh" <<EOF
+#!/usr/bin/env bash
+tries_file="$fake/tries"
+n=0
+[ -f "\$tries_file" ] && n="\$(cat "\$tries_file")"
+n=\$((n + 1))
+printf '%s\n' "\$n" > "\$tries_file"
+echo "agmsg daemon start: no usable Node found (need >= 22.13.0 with node:sqlite), so agmsgd cannot start. Nothing was changed." >&2
+exit 1
+EOF
+  chmod +x "$fake/scripts/daemon.sh"
+  run bash -c 'set -u; source "$1"; agmsg_install_restart_daemon "$2"' _ "$fns" "$fake"
+  [ "$(cat "$fake/tries")" = 1 ]
+}
+
+@test "agmsg_install_restart_daemon: a guarded skip (desired/op_gen changed while waiting) exits 0 but is NOT treated as confirmed running, so an existing down_notice is left in place" {
+  local fns fake="$FAKE_HOME/fake-skill3"
+  mkdir -p "$fake/run" "$fake/scripts/lib"
+  sqlite3 "$fake/run/install.db" "CREATE TABLE daemon_intent(desired TEXT, op_gen INT); INSERT INTO daemon_intent VALUES('on',9); CREATE TABLE daemon_owner(state TEXT); INSERT INTO daemon_owner VALUES('none');"
+  cp "$REPO_ROOT/scripts/lib/down-notice.sh" "$fake/scripts/lib/down-notice.sh"
+  ( . "$fake/scripts/lib/down-notice.sh" && down_notice_set agmsgd down stale stale )
+  [ -f "$fake/run/down/agmsgd.json" ]
+  fns="$(_install_fns)"
+  cat > "$fake/scripts/daemon.sh" <<EOF
+#!/usr/bin/env bash
+# cmd_start's own guarded-skip path (scripts/daemon.sh): desired/op_gen
+# moved on between this read and the guarded UPDATE, so it exits 0
+# having started nothing.
+echo "agmsg daemon start: agmsgd was turned off or changed while waiting; left as it is now"
+exit 0
+EOF
+  chmod +x "$fake/scripts/daemon.sh"
+  run bash -c 'set -u; source "$1"; agmsg_install_restart_daemon "$2"' _ "$fns" "$fake"
+  [ "$status" -eq 0 ]
+  [ -f "$fake/run/down/agmsgd.json" ]
+}
+
+@test "agmsg_install_restart_daemon: a recovery command for an install path containing a space tokenizes and resolves correctly (review round 3)" {
+  local fns fake="$FAKE_HOME/side install"
+  mkdir -p "$fake/run" "$fake/scripts/lib"
+  sqlite3 "$fake/run/install.db" "CREATE TABLE daemon_intent(desired TEXT, op_gen INT); INSERT INTO daemon_intent VALUES('on',5); CREATE TABLE daemon_owner(state TEXT); INSERT INTO daemon_owner VALUES('none');"
+  cp "$REPO_ROOT/scripts/lib/down-notice.sh" "$fake/scripts/lib/down-notice.sh"
+  fns="$(_install_fns)"
+  cat > "$fake/scripts/daemon.sh" <<EOF
+#!/usr/bin/env bash
+echo "agmsg daemon start: no usable Node found (need >= 22.13.0 with node:sqlite), so agmsgd cannot start. Nothing was changed." >&2
+exit 1
+EOF
+  chmod +x "$fake/scripts/daemon.sh"
+  # An owned mock standing in for the real scripts/agmsg wrapper -- never a
+  # real install -- so the persisted recovery command can actually be run
+  # and its tokenization checked, not just inspected as text.
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$#:$*" >> "%s/agmsg-argv-log"\n' "$fake" > "$fake/scripts/agmsg"
+  chmod +x "$fake/scripts/agmsg"
+  run bash -c 'set -u; source "$1"; agmsg_install_restart_daemon "$2"' _ "$fns" "$fake"
+  [ "$status" -eq 0 ]
+  [ -f "$fake/run/down/agmsgd.json" ]
+  local recovery
+  recovery="$(( . "$fake/scripts/lib/down-notice.sh" && down_notice_list ) | awk -F'\t' '{print $5}')"
+  # Quoted (single quotes), not the bare path -- a bare path with a space
+  # is not a valid command to eval at all (the point of this test).
+  [ "$recovery" = "'$fake/scripts/agmsg' daemon start" ]
+  eval "$recovery"
+  [ "$(cat "$fake/agmsg-argv-log")" = "2:daemon start" ]
+}
+
+@test "agmsg_install_restart_daemon: a recovery command for an install path containing an apostrophe tokenizes and resolves correctly" {
+  # Same setup as the space-path case above, but for the install-path
+  # character down_notice_set's own sanitizer used to corrupt by destroying
+  # the backslash a single-quote escape needs (#1929's regression test
+  # through this caller).
+  local fns fake="$FAKE_HOME/side's install"
+  mkdir -p "$fake/run" "$fake/scripts/lib"
+  sqlite3 "$fake/run/install.db" "CREATE TABLE daemon_intent(desired TEXT, op_gen INT); INSERT INTO daemon_intent VALUES('on',5); CREATE TABLE daemon_owner(state TEXT); INSERT INTO daemon_owner VALUES('none');"
+  cp "$REPO_ROOT/scripts/lib/down-notice.sh" "$fake/scripts/lib/down-notice.sh"
+  fns="$(_install_fns)"
+  cat > "$fake/scripts/daemon.sh" <<EOF
+#!/usr/bin/env bash
+echo "agmsg daemon start: no usable Node found (need >= 22.13.0 with node:sqlite), so agmsgd cannot start. Nothing was changed." >&2
+exit 1
+EOF
+  chmod +x "$fake/scripts/daemon.sh"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$#:$*" >> "%s/agmsg-argv-log"\n' "$fake" > "$fake/scripts/agmsg"
+  chmod +x "$fake/scripts/agmsg"
+  run bash -c 'set -u; source "$1"; agmsg_install_restart_daemon "$2"' _ "$fns" "$fake"
+  [ "$status" -eq 0 ]
+  [ -f "$fake/run/down/agmsgd.json" ]
+  local recovery
+  recovery="$(( . "$fake/scripts/lib/down-notice.sh" && down_notice_list ) | awk -F'\t' '{print $5}')"
+  eval "$recovery"
+  [ "$(cat "$fake/agmsg-argv-log")" = "2:daemon start" ]
+}
+
+# #1941/#1928 regression: install.sh's own top-level `. "$SCRIPT_DIR/scripts/
+# lib/down-notice.sh"` (added by #1928, line ~36, ABOVE the "# --- Defaults
+# ---" marker `_install_fns` cuts at) sets down-notice.sh's include guard and
+# resolves its root to wherever THIS sourcing happens to run from. The two
+# tests above only ever exercise agmsg_install_restart_daemon's FAILURE
+# branch (down_notice_set) -- this one targets its SUCCESS branch
+# (down_notice_clear) instead, the one the apostrophe/space tests above
+# cannot reach because their fake daemon.sh always fails. Caught directly
+# (not via real daemon.sh, so a real Node/nvm resolution on the test machine
+# can never mask it the way it masked the end-to-end install/update tests
+# in a review): a `( . "$fake/..." )` re-source inherits that guard
+# like any other variable, so without AGMSG_DOWN_NOTICE_ROOT the clear would
+# silently act on the WRONG root (wherever $fns was sourced from, never
+# `$fake`) instead of returning an error -- this must be caught by checking
+# the RIGHT root was touched, not just that the call did not fail.
+@test "agmsg_install_restart_daemon: a successful restart clears THIS install's own down_notice, not the sourcing root's" {
+  local fns fake="$FAKE_HOME/fake-skill-clear" wrong_root="$FAKE_HOME/wrong-root"
+  mkdir -p "$fake/run" "$fake/scripts/lib"
+  sqlite3 "$fake/run/install.db" "CREATE TABLE daemon_intent(desired TEXT, op_gen INT); INSERT INTO daemon_intent VALUES('on',5); CREATE TABLE daemon_owner(state TEXT); INSERT INTO daemon_owner VALUES('none');"
+  cp "$REPO_ROOT/scripts/lib/down-notice.sh" "$fake/scripts/lib/down-notice.sh"
+  # A pre-existing down_notice, as if an earlier restart attempt had failed.
+  ( . "$fake/scripts/lib/down-notice.sh" && down_notice_set agmsgd down stale stale )
+  [ -f "$fake/run/down/agmsgd.json" ]
+  fns="$(_install_fns)"
+  # The wrong root THIS SPECIFIC invocation shape resolves to (measured):
+  # `bash -c '...' _ "$fns" "$fake"` makes $0 literally "_", so
+  # install.sh's own top-level `$SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"`
+  # (dirname of "_" is ".") resolves to the CALLER's CWD -- not $fake, not
+  # $REPO_ROOT by necessity, just whatever directory the call happens to run
+  # from. Pinned here to a disposable fixture under $FAKE_HOME (own,
+  # per-test, torn down by this file's own setup/teardown (FAKE_HOME is a
+  # fresh mktemp per test, removed in teardown) whether this
+  # test passes or fails) rather than the real checkout (review: an earlier
+  # version used $REPO_ROOT itself, outside any fixture, cleaned up only
+  # after every assertion -- a real leak on an early failure, and not
+  # atomic against a concurrent run). A full copy of scripts/lib, not just
+  # down-notice.sh: the extracted function text ALSO top-level-sources every
+  # other scripts/lib/*.sh install.sh normally sources first, all resolved
+  # against this same wrong root, and a missing one would abort the whole
+  # call before ever reaching agmsg_install_restart_daemon.
+  mkdir -p "$wrong_root/scripts"
+  cp -R "$REPO_ROOT/scripts/lib" "$wrong_root/scripts/lib"
+  # A sentinel down_notice, sourced first (review): down_notice_clear cannot
+  # CREATE a file, so an absent-elsewhere check alone (the only assertion
+  # the first version of this test had) proves nothing about whether the
+  # wrong root was written to -- a present sentinel that survives proves it
+  # was not.
+  ( . "$wrong_root/scripts/lib/down-notice.sh" && down_notice_set agmsgd down unrelated unrelated )
+  [ -f "$wrong_root/run/down/agmsgd.json" ]
+  # A stub daemon.sh that always reports a successful start, unconditionally
+  # -- real Node resolution (nvm, AGMSG_CODEX_NODE, ...) plays no part here,
+  # so this result cannot be an accident of what happens to be on this
+  # machine's PATH.
+  cat > "$fake/scripts/daemon.sh" <<EOF
+#!/usr/bin/env bash
+echo "agmsg daemon start: running"
+exit 0
+EOF
+  chmod +x "$fake/scripts/daemon.sh"
+  run bash -c 'cd "$1" && set -u && source "$2" && agmsg_install_restart_daemon "$3"' _ "$wrong_root" "$fns" "$fake"
+  [ "$status" -eq 0 ]
+  [ ! -f "$fake/run/down/agmsgd.json" ]
+  # The wrong-root sentinel must survive, untouched -- the positive half of
+  # the claim an absence-only check could never make.
+  [ -f "$wrong_root/run/down/agmsgd.json" ]
+  grep -q unrelated "$wrong_root/run/down/agmsgd.json"
+}
+
+# A CI-only (never reproduced locally) failure measured on #1904: a schema
+# apply right after a prior test's real agmsgd stop occasionally failed with
+# "could not apply the daemon schema to install.db" -- `cmd_stop` confirms
+# install.db's own row says the daemon is gone before returning, not that
+# the OS process has actually released its own sqlite3 connection, so a
+# caller right behind it can still race that close. Every other sqlite3 call
+# against install.db in this codebase already carries a `.timeout`
+# (daemon-state.sh, daemon-seats.sh, install.sh's own reads, ...); this
+# function was the one write path that did not. Proven directly here, not by
+# trying to reproduce the exact agmsgd-shutdown race: a background writer
+# holds an EXCLUSIVE transaction on the schema's own db file for longer than
+# sqlite3's default busy_timeout (0, i.e. fail immediately) but well inside
+# the 5000ms this function now asks for, and the call still succeeds once
+# that writer lets go.
+@test "agmsg_install_db_apply_schema: tolerates a brief exclusive hold instead of failing immediately" {
+  local lib="$REPO_ROOT/scripts/lib" db="$FAKE_HOME/install.db" schema="$REPO_ROOT/scripts/daemon/schema.sql" fifodir in_fifo out_fifo holder_pid
+  # The real bootstrap, not a hand-rolled meta table: schema.sql expects
+  # columns (schema_version among them) a minimal stand-in would not have,
+  # which fails for an unrelated reason (a genuine schema mismatch) that
+  # looks identical to this test's own subject from the outside -- confirmed
+  # by reproducing it directly while developing this case.
+  bash -c 'source "$1/sqlite-output.sh"; source "$1/install-db.sh"; agmsg_install_db_ensure_meta "$2"' _ "$lib" "$db" >/dev/null
+  # A real held EXCLUSIVE lock, not a fake one -- a plain heredoc/pipe into
+  # sqlite3 hits EOF and ends the transaction as soon as it is written, so
+  # this needs the same fifo-backed, held-open connection pattern
+  # install-op-lock.sh uses for the same reason (sqlite3 only holds the lock
+  # for as long as its stdin stays open). Under $FAKE_HOME, not a separate
+  # mktemp dir outside it (review): this file's own teardown only removes
+  # $FAKE_HOME, so anything meant to be cleaned up automatically has to live
+  # there.
+  fifodir="$FAKE_HOME/lock-fifos"
+  in_fifo="$fifodir/in"; out_fifo="$fifodir/out"
+  mkdir -p "$fifodir"
+  mkfifo "$in_fifo" "$out_fifo"
+  sqlite3 "$db" < "$in_fifo" > "$out_fifo" 2>&1 &
+  holder_pid=$!
+  # Registered with teardown's own owned-pid mechanism IMMEDIATELY (before
+  # any assertion that could end the test, per that function's own
+  # docstring) -- rather than this test's own unconfirmed `kill` at the end,
+  # which both skips the ownership check every other teardown-reaped process
+  # in this file gets, and never runs at all if an assertion below fails
+  # first (review: this test's own assertions sit between the fork and that
+  # kill, exactly the gap #963 was raised about elsewhere in this file).
+  _agmsg_watch_pid "$holder_pid" "sqlite3 $db"
+  exec 9> "$in_fifo"
+  exec 8< "$out_fifo"
+  printf '.timeout 1000\nBEGIN EXCLUSIVE;\nSELECT '"'"'held'"'"';\n' >&9
+  local line
+  IFS= read -r -t 5 -u 8 line
+  [ "$line" = held ]
+  # Released well inside this function's own 5000ms timeout, from a second
+  # process so the release genuinely overlaps the foreground call below
+  # rather than happening before it starts. Bounded and self-terminating
+  # either way (one sleep, one write, exit) even if an assertion below ends
+  # the test before the `wait` for it is reached -- nothing here needs
+  # teardown's help to not linger.
+  ( sleep 0.5; printf 'COMMIT;\n' >&9 2>/dev/null || true ) &
+  local releaser_pid=$!
+  run bash -c 'source "$1/sqlite-output.sh"; source "$1/install-db.sh"; agmsg_install_db_apply_schema "$2" "$3"' _ "$lib" "$db" "$schema"
+  wait "$releaser_pid" 2>/dev/null || true
+  exec 9>&- 8<&-
+  [ "$status" -eq 0 ]
+  # The schema genuinely applied, not just "did not error": daemon_intent's
+  # own always-exactly-one-row seed (schema.sql) is present.
+  [ "$(sqlite3 "$db" "SELECT count(*) FROM daemon_intent;")" = 1 ]
+}
+
 @test "install: ships an executable uninstall.sh so npx/curl installs have one to run later" {
   # setup.sh's temp checkout is deleted right after install, so a copy inside
   # the skill dir is the only uninstaller npx/curl-installed users ever have.
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   [ -x "$SK/uninstall.sh" ]
   diff "$REPO_ROOT/uninstall.sh" "$SK/uninstall.sh"
 }
 
 @test "install: --update refreshes uninstall.sh even if it went missing" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   rm -f "$SK/uninstall.sh"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
   [ -x "$SK/uninstall.sh" ]
@@ -626,7 +1106,7 @@ _agy_failing_mv_fixture() {
 # before this rename would keep the stale SKILL.md forever without an
 # explicit cleanup on --update.
 @test "install --update: removes a pre-rename drivers/terminals/{herdr,plain,tmux}/SKILL.md, leaving only README.md" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   for d in herdr plain tmux; do
     cp "$SK/scripts/drivers/terminals/$d/README.md" "$SK/scripts/drivers/terminals/$d/SKILL.md"
   done
@@ -644,7 +1124,7 @@ _agy_failing_mv_fixture() {
 # sanctioned AGMSG_PLUGIN_DIRS mechanism), and a glob-based cleanup would
 # delete a SKILL.md this install does not own.
 @test "install --update: does NOT touch a user-added driver's own SKILL.md under drivers/terminals/" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   mkdir -p "$SK/scripts/drivers/terminals/mycustom"
   echo "user's own driver doc" > "$SK/scripts/drivers/terminals/mycustom/SKILL.md"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
@@ -653,7 +1133,7 @@ _agy_failing_mv_fixture() {
 }
 
 @test "install: --update --cmd updates the named skill even when a backup skill exists" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   local backup="$FAKE_HOME/.agents/skills/agmsg.backup-keep"
   mkdir -p "$backup/scripts" "$backup/templates" "$backup/db" "$backup/agents"
   touch "$backup/.agmsg"
@@ -669,7 +1149,7 @@ _agy_failing_mv_fixture() {
 }
 
 @test "install: --update with no --cmd refuses to guess between two real installs (#599)" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-second
   # Distinct per-install sentinels, not just each install's VERSION (which is
   # the same source-derived string for both and would not distinguish "one of
@@ -698,7 +1178,7 @@ _agy_failing_mv_fixture() {
   # not special-case names at all. A directory that still carries the .agmsg
   # marker is just another candidate, and more than one candidate is exactly
   # the ambiguity this fix already refuses to guess through.
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   local leftover="$FAKE_HOME/.agents/skills/agmsg.bak-20260731"
   mkdir -p "$leftover/scripts" "$leftover/templates" "$leftover/db" "$leftover/agents"
   touch "$leftover/.agmsg"
@@ -744,7 +1224,7 @@ _agy_failing_mv_fixture() {
 }
 
 @test "install: --update warns to re-register delivery hooks (#133)" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   run env HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --update
   [ "$status" -eq 0 ]
   # Surface the silent-delivery-loss footgun: an upgrade can drop a project's
@@ -763,7 +1243,7 @@ _agy_failing_mv_fixture() {
 # technique test_remote_status_liveness.bats uses; entirely within
 # FAKE_HOME, so this never touches a real installed engine.
 @test "install --update: replaces a running sync engine with one on the new code (#963)" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   bash "$SK/scripts/join.sh" testteam alice claude-code /tmp/install-963-proj
 
   local cfg="$SK/teams/testteam/config.json" escaped updated
@@ -868,7 +1348,7 @@ _agy_failing_mv_fixture() {
 }
 
 @test "install: AGMSG_STORAGE_PATH override works against the installed skill" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   bash "$SK/scripts/join.sh" demo alice claude-code /tmp/install-override-projA
   bash "$SK/scripts/join.sh" demo bob   claude-code /tmp/install-override-projB
   local store="$FAKE_HOME/override-store"
@@ -886,7 +1366,7 @@ _agy_failing_mv_fixture() {
 # any directly-invoked script — invoke via `env -i` so nothing from the
 # bats environment leaks into the child shell.
 @test "install: actas-claim runs in a fresh shell with no inherited env" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   bash "$SK/scripts/join.sh" demo alice claude-code /tmp/install-projA
 
   run env -i PATH=/usr/bin:/bin:/usr/local/bin HOME="$FAKE_HOME" \
@@ -914,8 +1394,7 @@ wait_for_pidfile_pid() {
 }
 
 @test "install: drops a Copilot SKILL.md when ~/.copilot exists" {
-  mkdir -p "$FAKE_HOME/.copilot"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install --marker .copilot
   local copilot_skill="$FAKE_HOME/.copilot/skills/agmsg/SKILL.md"
   [ -f "$copilot_skill" ]
   # The Copilot SKILL.md must drive whoami with type=copilot, not codex,
@@ -927,15 +1406,12 @@ wait_for_pidfile_pid() {
 }
 
 @test "install: skips Copilot skill when ~/.copilot is absent" {
-  # Make sure ~/.copilot isn't there
-  rm -rf "$FAKE_HOME/.copilot"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   [ ! -d "$FAKE_HOME/.copilot" ]
 }
 
 @test "install --update: refreshes the Copilot skill if it was previously installed" {
-  mkdir -p "$FAKE_HOME/.copilot"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install --marker .copilot
   local copilot_skill="$FAKE_HOME/.copilot/skills/agmsg/SKILL.md"
   [ -f "$copilot_skill" ]
   # Mutate the file so we can verify --update overwrites.
@@ -952,7 +1428,7 @@ wait_for_pidfile_pid() {
 @test "install --update: installs Copilot skill for upgraders without prior skill" {
   # First install without ~/.copilot, simulating a Copilot-less environment
   # at the time the user originally installed agmsg.
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   [ ! -d "$FAKE_HOME/.copilot/skills/agmsg" ]
   # User then installs Copilot CLI and runs --update.
   mkdir -p "$FAKE_HOME/.copilot"
@@ -962,8 +1438,7 @@ wait_for_pidfile_pid() {
 }
 
 @test "install: drops an OpenCode SKILL.md when ~/.config/opencode exists" {
-  mkdir -p "$FAKE_HOME/.config/opencode"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install --marker .config/opencode
   local opencode_skill="$FAKE_HOME/.config/opencode/skills/agmsg/SKILL.md"
   [ -f "$opencode_skill" ]
   # The OpenCode SKILL.md must drive whoami with type=opencode, not codex,
@@ -974,14 +1449,12 @@ wait_for_pidfile_pid() {
 }
 
 @test "install: skips OpenCode skill when ~/.config/opencode is absent" {
-  rm -rf "$FAKE_HOME/.config/opencode"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   [ ! -d "$FAKE_HOME/.config/opencode/skills/agmsg" ]
 }
 
 @test "install --update: refreshes the OpenCode skill if it was previously installed" {
-  mkdir -p "$FAKE_HOME/.config/opencode"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install --marker .config/opencode
   local opencode_skill="$FAKE_HOME/.config/opencode/skills/agmsg/SKILL.md"
   [ -f "$opencode_skill" ]
   echo "tampered" > "$opencode_skill"
@@ -991,7 +1464,7 @@ wait_for_pidfile_pid() {
 }
 
 @test "install --update: installs OpenCode skill for upgraders without prior skill" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   [ ! -d "$FAKE_HOME/.config/opencode/skills/agmsg" ]
   mkdir -p "$FAKE_HOME/.config/opencode"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
@@ -1077,7 +1550,7 @@ SH
 
   run env HOME="$FAKE_HOME" PATH="$fake_bin:$PATH" SQLITE_MODE=crlf-canary \
     bash -c 'source "$1"; agmsg_install_op_lock "$2" 1000 || exit 1; agmsg_install_op_confirm || exit 2; printf "lock acquired\\n"; agmsg_install_op_unlock' \
-    _ "$REPO_ROOT/scripts/lib/install-op-lock.sh" "$FAKE_HOME/run/install-op.lock.db"
+    _ "$REPO_ROOT/scripts/lib/install-op-lock.sh" "$FAKE_HOME/.install-op/lock.db"
   [ "$status" -eq 0 ]
   grep -Fq -- "lock acquired" <<<"$output"
 }
@@ -1234,7 +1707,7 @@ SH
 }
 
 @test "install: watch.sh self-cleans a prior watcher on re-invocation for the same sid" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   bash "$SK/scripts/join.sh" demo alice claude-code /tmp/install-projA
   local sid="resue-sid-$$"
 
@@ -1314,7 +1787,7 @@ SH
 }
 
 @test "install: records a git-describe provenance VERSION and /version prints it" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   # install.sh runs from a git checkout here, so the recorded version is a
   # `git describe` string: a tag (v1.2.3-N-gSHA) when tags are present, or — in
   # a tag-less checkout like CI's shallow clone — the bare abbreviated commit
@@ -1366,7 +1839,7 @@ SH
 }
 
 @test "install: --update refreshes the recorded VERSION" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   echo "stale-marker" > "$SK/VERSION"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
   run cat "$SK/VERSION"
@@ -1374,7 +1847,7 @@ SH
 }
 
 @test "version.sh falls back gracefully when no VERSION was recorded" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   rm -f "$SK/VERSION"
   run bash "$SK/scripts/version.sh"
   [ "$status" -eq 0 ]
@@ -1410,21 +1883,21 @@ EOF
 
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
 
-  grep -q "$SK/db" "$FAKE_HOME/.codex/config.toml"
-  grep -q "$SK/teams" "$FAKE_HOME/.codex/config.toml"
-  grep -q "$SK/run" "$FAKE_HOME/.codex/config.toml"
+  grep -q "$(state_path db)" "$FAKE_HOME/.codex/config.toml"
+  grep -q "$(state_path teams)" "$FAKE_HOME/.codex/config.toml"
+  grep -q "$(state_path run)" "$FAKE_HOME/.codex/config.toml"
   # A sandboxed Codex seat runs an ext-tool member's `setup` (secret and
   # save) too, which writes under ext-tools/ the same way the bridge writes
   # under db/teams/run — measured directly against a real seat
   # (`codex exec -s workspace-write`) before this entry existed:
   # `mkdir: .../ext-tools/<team>: Operation not permitted`.
-  grep -q "$SK/ext-tools" "$FAKE_HOME/.codex/config.toml"
+  grep -q "$(state_path ext-tools)" "$FAKE_HOME/.codex/config.toml"
 }
 
 @test "install/update/uninstall: CODEX_HOME isolates the default Codex config (#1718)" {
   source "$REPO_ROOT/scripts/lib/codex-config.sh"
   local native_root
-  native_root="$(agmsg_codex_native_path "$SK")"
+  native_root="$(agmsg_codex_native_path "$(state_path)")"
   local profile_home="$FAKE_HOME/.codex_profiles/work"
   mkdir -p "$FAKE_HOME/.codex" "$profile_home"
   printf 'model = "default-sentinel"\n' > "$FAKE_HOME/.codex/config.toml"
@@ -1489,7 +1962,7 @@ EOF
 
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
 
-  grep -q "$SK/run" "$FAKE_HOME/.codex/config.toml"
+  grep -q "$(state_path run)" "$FAKE_HOME/.codex/config.toml"
 }
 
 @test "install: fills an existing EMPTY Codex writable_roots without corrupting TOML" {
@@ -1504,9 +1977,9 @@ EOF
   # The empty-array path used to emit `[, "..."]` — a leading comma, which is
   # invalid TOML and broke the user's Codex config.
   refute grep -Eq '\[[[:space:]]*,' "$FAKE_HOME/.codex/config.toml"
-  grep -q "$SK/db" "$FAKE_HOME/.codex/config.toml"
-  grep -q "$SK/teams" "$FAKE_HOME/.codex/config.toml"
-  grep -q "$SK/run" "$FAKE_HOME/.codex/config.toml"
+  grep -q "$(state_path db)" "$FAKE_HOME/.codex/config.toml"
+  grep -q "$(state_path teams)" "$FAKE_HOME/.codex/config.toml"
+  grep -q "$(state_path run)" "$FAKE_HOME/.codex/config.toml"
 
   # Parse end-to-end when a TOML reader is available, to prove validity.
   if command -v python3 >/dev/null 2>&1; then
@@ -1538,9 +2011,9 @@ EOF
   # The link survives: `mv` would have replaced it with a plain file (#747).
   [ -L "$FAKE_HOME/.codex/config.toml" ]
   # The edit reached the link's target, not a detached copy at the link path.
-  grep -q "$SK/db" "$FAKE_HOME/dotfiles/config.toml"
-  grep -q "$SK/teams" "$FAKE_HOME/dotfiles/config.toml"
-  grep -q "$SK/run" "$FAKE_HOME/dotfiles/config.toml"
+  grep -q "$(state_path db)" "$FAKE_HOME/dotfiles/config.toml"
+  grep -q "$(state_path teams)" "$FAKE_HOME/dotfiles/config.toml"
+  grep -q "$(state_path run)" "$FAKE_HOME/dotfiles/config.toml"
   # The pre-existing entry is kept.
   grep -q "/some/existing/path" "$FAKE_HOME/dotfiles/config.toml"
 }
@@ -1557,8 +2030,8 @@ EOF
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
 
   [ -L "$FAKE_HOME/.codex/config.toml" ]
-  grep -q "$SK/db" "$FAKE_HOME/dotfiles/config.toml"
-  grep -q "$SK/run" "$FAKE_HOME/dotfiles/config.toml"
+  grep -q "$(state_path db)" "$FAKE_HOME/dotfiles/config.toml"
+  grep -q "$(state_path run)" "$FAKE_HOME/dotfiles/config.toml"
 }
 
 @test "install: an ordinary Codex config.toml is replaced atomically, not truncated in place (#747 control)" {
@@ -1577,7 +2050,7 @@ EOF
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
 
   [ ! -L "$FAKE_HOME/.codex/config.toml" ]
-  grep -q "$SK/db" "$FAKE_HOME/.codex/config.toml"
+  grep -q "$(state_path db)" "$FAKE_HOME/.codex/config.toml"
   grep -q "/some/existing/path" "$FAKE_HOME/.codex/config.toml"
   local ino_after; ino_after="$(ls -i "$FAKE_HOME/.codex/config.toml" | awk '{print $1}')"
   [ "$ino_after" != "$ino_before" ]
@@ -1587,8 +2060,7 @@ EOF
 # --- hermes Agent skill (~/.hermes/skills/<name>/SKILL.md) ---
 
 @test "install: drops a Hermes skill when ~/.hermes exists" {
-  mkdir -p "$FAKE_HOME/.hermes"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install --marker .hermes
   local hermes_skill="$FAKE_HOME/.hermes/skills/agmsg/SKILL.md"
   [ -f "$hermes_skill" ]
   grep -q "whoami.sh \"\$(pwd)\" hermes" "$hermes_skill"
@@ -1597,8 +2069,7 @@ EOF
 }
 
 @test "install: Hermes skill no longer advertises 'spawn hermes' as a valid example (#279)" {
-  mkdir -p "$FAKE_HOME/.hermes"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install --marker .hermes
   local hermes_skill="$FAKE_HOME/.hermes/skills/agmsg/SKILL.md"
   [ -f "$hermes_skill" ]
   refute grep -q "spawn hermes reviewer" "$hermes_skill"
@@ -1651,8 +2122,7 @@ EOF
 }
 
 @test "install --update: refreshes the Hermes skill if it was previously installed" {
-  mkdir -p "$FAKE_HOME/.hermes"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install --marker .hermes
   local hermes_skill="$FAKE_HOME/.hermes/skills/agmsg/SKILL.md"
   [ -f "$hermes_skill" ]
   echo "tampered" > "$hermes_skill"
@@ -1662,7 +2132,7 @@ EOF
 }
 
 @test "install --update: installs Hermes skill for upgraders without prior skill" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   [ ! -d "$FAKE_HOME/.hermes/skills/agmsg" ]
   mkdir -p "$FAKE_HOME/.hermes"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
@@ -1671,7 +2141,7 @@ EOF
 }
 
 @test "install: --update re-points an existing Codex monitor shim to the new path" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   # Install the shim the way enabling Codex monitor mode would.
   HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
   local shim="$FAKE_HOME/.agents/bin/codex"
@@ -1693,7 +2163,7 @@ EOF
 }
 
 @test "install: --update does NOT create a Codex shim when none was installed" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   [ ! -e "$FAKE_HOME/.agents/bin/codex" ]
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
   # The refresh is gated on an existing agmsg shim — it must not opt the user in.
@@ -1707,7 +2177,7 @@ EOF
 # as if it were a routine "refreshed" no-op.
 
 @test "install: a second, differently-named install does NOT clobber the first's Codex shim (#553)" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  _restore_install --cmd agmsg --agent-type codex
   HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
   local shim="$FAKE_HOME/.agents/bin/codex"
   [ -f "$shim" ]
@@ -1736,7 +2206,7 @@ EOF
   # second, differently-named install this way silently stole the shim from a
   # first install that was still perfectly alive and working -- the opposite
   # of what --cmd being explicit actually proves.
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  _restore_install --cmd agmsg --agent-type codex
   HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
   local shim="$FAKE_HOME/.agents/bin/codex"
   local before; before="$(grep AGMSG_CODEX_SHIM_SCRIPT_DIR "$shim")"
@@ -1761,7 +2231,7 @@ EOF
   # The #553 recovery case survives #1788's fix: when the install that
   # actually owns the shim no longer exists at all, there is nothing left to
   # steal it from, so --update --cmd may still take it over without --force.
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  _restore_install --cmd agmsg --agent-type codex
   HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
   local shim="$FAKE_HOME/.agents/bin/codex"
 
@@ -1785,7 +2255,7 @@ EOF
 }
 
 @test "install: AGMSG_CODEX_SHIM_FORCE=1 --update --cmd reclaims a Codex shim owned by another LIVE install (#1788)" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  _restore_install --cmd agmsg --agent-type codex
   HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
   local shim="$FAKE_HOME/.agents/bin/codex"
 
@@ -1813,7 +2283,7 @@ EOF
   # refusal is asserted, and the shim's owner line is asserted unchanged
   # across it. The single-install case, where a bare --update does proceed,
   # is the next test.
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  _restore_install --cmd agmsg --agent-type codex
   HOME="$FAKE_HOME" bash "$SK/scripts/drivers/types/codex/codex-shim-install.sh" install >/dev/null
   local shim="$FAKE_HOME/.agents/bin/codex"
   local before; before="$(grep AGMSG_CODEX_SHIM_SCRIPT_DIR "$shim")"
@@ -1839,7 +2309,7 @@ EOF
   # (review finding). Provably only one agmsg install existing at all is what
   # makes that safe without needing --cmd or --force: there is no other
   # install the shim could actually belong to.
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  _restore_install --cmd agmsg --agent-type codex
   local shim="$FAKE_HOME/.agents/bin/codex"
   mkdir -p "$FAKE_HOME/.agents/bin"
   # A legacy shim: real marker, but written before this PR added the owner
@@ -1875,7 +2345,7 @@ EOF
   # owner-unknown legacy shim without --force. This pins that a second,
   # differently-named install must not benefit from that allowance just
   # because its own marker hasn't been written yet.
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type codex
+  _restore_install --cmd agmsg --agent-type codex
   local shim="$FAKE_HOME/.agents/bin/codex"
   mkdir -p "$FAKE_HOME/.agents/bin"
   # A legacy shim: real marker, but no owner comment -- same shape as any
@@ -1915,13 +2385,12 @@ EOF
 }
 
 @test "install: skips Grok Build skill when ~/.grok is absent" {
-  rm -rf "$FAKE_HOME/.grok"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   [ ! -d "$FAKE_HOME/.grok" ]
 }
 
 @test "install --update: installs Grok Build skill for upgraders without prior skill" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   [ ! -d "$FAKE_HOME/.grok/skills/agmsg" ]
   mkdir -p "$FAKE_HOME/.grok"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
@@ -1932,8 +2401,7 @@ EOF
 # --- Antigravity skill (~/.gemini/config/skills/<name>/SKILL.md) ---
 
 @test "install: drops an Antigravity SKILL.md when ~/.gemini/config exists" {
-  mkdir -p "$FAKE_HOME/.gemini/config"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install --marker .gemini/config
   local antigravity_skill="$FAKE_HOME/.gemini/config/skills/agmsg/SKILL.md"
   [ -f "$antigravity_skill" ]
   grep -q "whoami.sh \"\$(pwd)\" antigravity" "$antigravity_skill"
@@ -1947,12 +2415,12 @@ EOF
 }
 
 @test "install: skips Antigravity skill when its markers are absent" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   [ ! -d "$FAKE_HOME/.gemini/config/skills/agmsg" ]
 }
 
 @test "install --update: installs Antigravity skill for upgraders without prior skill" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   [ ! -d "$FAKE_HOME/.gemini/config/skills/agmsg" ]
   mkdir -p "$FAKE_HOME/.gemini/config"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
@@ -1961,8 +2429,7 @@ EOF
 }
 
 @test "install --update: refreshes the Antigravity skill" {
-  mkdir -p "$FAKE_HOME/.gemini/config"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install --marker .gemini/config
   local antigravity_skill="$FAKE_HOME/.gemini/config/skills/agmsg/SKILL.md"
   printf '%s\n' tampered > "$antigravity_skill"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update
@@ -1971,7 +2438,7 @@ EOF
 }
 
 @test "install --update: removes the legacy top-level Antigravity resume helper" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   local old="$SK/scripts/antigravity-resume.sh"
   local current="$SK/scripts/drivers/types/antigravity/antigravity-resume.sh"
   [ ! -e "$old" ]
@@ -2005,7 +2472,7 @@ EOF
 # the first version of this prune) stays closed; and a second --update
 # clears the first generation's .trash/ before writing its own.
 @test "install --update: moves removed/overwritten scripts/ files to .trash/ (one generation), never touches user data, and closes the newline escape" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   local trash="$SK/.trash"
 
   local pure_leftover="$SK/scripts/hook.sh"
@@ -2087,8 +2554,7 @@ EOF
 }
 
 @test "uninstall: removes the Antigravity skill" {
-  mkdir -p "$FAKE_HOME/.gemini/config"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install --marker .gemini/config
   [ -d "$FAKE_HOME/.gemini/config/skills/agmsg" ]
   HOME="$FAKE_HOME" bash "$REPO_ROOT/uninstall.sh" --yes
   [ ! -e "$FAKE_HOME/.gemini/config/skills/agmsg" ]
@@ -2154,7 +2620,7 @@ EOF
 # this bug, where the team directory appears and the membership does not. So
 # this asserts the membership is actually there afterwards.
 @test "install: on Windows too, join.sh writes the membership it just announced" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
 
   run bash "$SK/scripts/join.sh" wteam alice claude-code /tmp/install-wteam
   [ "$status" -eq 0 ]
@@ -2254,7 +2720,7 @@ CYG
 # so without the store walk the upgrade we tell people to run leaves them exactly
 # as stuck as before -- having done what we asked.
 @test "install --update: clears group-write on a binding an older release left 0664 (#804)" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   bash "$SK/scripts/join.sh" upg alice claude-code /tmp/install-804-a
 
   local cfg before after
@@ -2286,7 +2752,7 @@ CYG
 }
 
 @test "install --update: leaves a binding the readers already accept alone (#804)" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   bash "$SK/scripts/join.sh" keep alice claude-code /tmp/install-804-b
 
   local cfg before after
@@ -2314,7 +2780,7 @@ CYG
 # half needs its own row, or deleting either one stays green. 0664 is the
 # reported shape; this is the other.
 @test "install --update: clears other-write on a binding left 0646 (#804)" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   bash "$SK/scripts/join.sh" oth alice claude-code /tmp/install-804-c
 
   local cfg before after
@@ -2340,7 +2806,7 @@ CYG
 # changed a file OUTSIDE the store and announced a repair that repaired nothing,
 # because the binding stays refused either way.
 @test "install --update: does not follow a symlinked binding to something outside the store (#804)" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   bash "$SK/scripts/join.sh" lnk alice claude-code /tmp/install-804-d
 
   local cfg outside before after
@@ -2385,7 +2851,7 @@ CYG
 # does not match it -- silently, which is the whole failure mode of this issue
 # repeated one level up.
 @test "install --update: corrects a binding under a dot-leading team name (#804)" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   bash "$SK/scripts/join.sh" .dotteam alice claude-code /tmp/install-804-e
 
   local cfg before after
@@ -2411,7 +2877,7 @@ CYG
 # with -- on every update, on the one platform where that sentence cannot be
 # true.
 @test "install --update: does not touch or announce bindings on Windows (#804)" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  _restore_install
   bash "$SK/scripts/join.sh" win alice claude-code /tmp/install-804-f
 
   local cfg before after
@@ -2463,7 +2929,7 @@ CYG
   # The operation lock DB must exist, never be empty-deleted by install
   # itself, and never appear in the manifest's own file listing (it lives
   # under run/, not scripts/).
-  [ -f "$SK/run/install-op.lock.db" ]
+  [ -f "$SK/.install-op/lock.db" ]
 
   local id1 gen1
   id1="$(sqlite3 :memory: "SELECT json_extract(readfile('$(rf "$manifest")'), '\$.install_id');")"
@@ -2480,7 +2946,7 @@ CYG
   # later PR) to check against under the operation lock.
   local bv
   bv="$(sqlite3 :memory: "SELECT json_extract(readfile('$(rf "$manifest")'), '\$.bootstrap_version');")"
-  [ "$bv" = "2" ]
+  [ "$bv" = "3" ]
 
   # install_id's one source of truth is install.db's meta row; the manifest
   # only carries a copy of it.
@@ -2491,7 +2957,7 @@ CYG
   # The lock DB holds no tables of its own -- it exists only to be BEGIN
   # EXCLUSIVE'd.
   local lock_tables
-  lock_tables="$(sqlite3 "$SK/run/install-op.lock.db" "SELECT count(*) FROM sqlite_master WHERE type='table';")"
+  lock_tables="$(sqlite3 "$SK/.install-op/lock.db" "SELECT count(*) FROM sqlite_master WHERE type='table';")"
   [ "$lock_tables" = "0" ]
 
   # The two daemon bootstrap files were placed (not left out by the bulk
@@ -2633,7 +3099,7 @@ CYG
   done
   if [ -e "$entered" ]; then
     if bash -c 'source "$1"; if agmsg_install_op_lock "$2" 300; then agmsg_install_op_unlock; exit 3; else exit 0; fi' \
-        _ "$REPO_ROOT/scripts/lib/install-op-lock.sh" "$SK/run/install-op.lock.db"; then
+        _ "$REPO_ROOT/scripts/lib/install-op-lock.sh" "$SK/.install-op/lock.db"; then
       blocked=1
     fi
   fi
@@ -2664,14 +3130,14 @@ CYG
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'test_home="${AGMSG_TEST_INSTALL_LOCK_LOSS_DIR%/lock-loss}"' \
-    'lock_db="$test_home/.agents/skills/agmsg/run/install-op.lock.db"' \
+    'lock_db="$test_home/.agents/skills/agmsg/.install-op/lock.db"' \
     'if [ "${1:-}" = "$lock_db" ]; then printf "%s\\n" "$$" > "$AGMSG_TEST_INSTALL_LOCK_LOSS_DIR/lock.pid"; fi' \
     "exec $sqlite_q \"\$@\"" > "$bin/sqlite3"
   chmod +x "$bin/sqlite3"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'test_home="${AGMSG_TEST_INSTALL_LOCK_LOSS_DIR%/lock-loss}"' \
-    'lock_db="$test_home/.agents/skills/agmsg/run/install-op.lock.db"' \
+    'lock_db="$test_home/.agents/skills/agmsg/.install-op/lock.db"' \
     'target="$test_home/.agents/skills/agmsg/scripts/"' \
     'dest=""; for arg do dest="$arg"; done' \
     'if [ "$dest" = "$target" ] && [ ! -e "$AGMSG_TEST_INSTALL_LOCK_LOSS_DIR/fired" ]; then' \
@@ -2739,7 +3205,7 @@ CYG
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'test_home="${AGMSG_TEST_INSTALL_LOCK_LOSS_DIR%/cancel-writer}"' \
-    'lock_db="$test_home/.agents/skills/agmsg/run/install-op.lock.db"' \
+    'lock_db="$test_home/.agents/skills/agmsg/.install-op/lock.db"' \
     'if [ "${1:-}" = "$lock_db" ]; then printf "%s\\n" "$$" > "$AGMSG_TEST_INSTALL_LOCK_LOSS_DIR/lock.pid"; fi' \
     "exec $sqlite_q \"\$@\"" > "$bin/sqlite3"
   chmod +x "$bin/sqlite3"
@@ -2766,7 +3232,7 @@ CYG
   writer_pid="$(cat "$inject_dir/writer.pid")"
   lock_pid="$(cat "$inject_dir/lock.pid")"
   _agmsg_watch_pid "$writer_pid" "$bin/cp"
-  _agmsg_watch_pid "$lock_pid" "$SK/run/install-op.lock.db"
+  _agmsg_watch_pid "$lock_pid" "$SK/.install-op/lock.db"
   [ -e "$SK/run/install-op-incomplete.json" ]
 
   kill -TERM "$install_pid"
@@ -2792,7 +3258,7 @@ CYG
   writer_pid="$(cat "$inject_dir/writer.pid")"
   lock_pid="$(cat "$inject_dir/lock.pid")"
   _agmsg_watch_pid "$writer_pid" "$bin/cp"
-  _agmsg_watch_pid "$lock_pid" "$SK/run/install-op.lock.db"
+  _agmsg_watch_pid "$lock_pid" "$SK/.install-op/lock.db"
   op_id="$(sqlite3 :memory: "SELECT json_extract(readfile('$(rf "$SK/run/install-op-incomplete.json")'), '\$.operation_id');")"
   kill -KILL "$install_pid"
   if wait "$install_pid"; then install_rc=0; else install_rc=$?; fi
@@ -2871,19 +3337,22 @@ CYG
   [ ! -e "$SK/run/install-op-incomplete.json" ]
 }
 
-@test "uninstall keeps run/install-op.lock.db while removing everything else" {
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  [ -f "$SK/run/install-op.lock.db" ]
+@test "uninstall removes everything but .install-op/lock.db once it has let go of the lock" {
+  _restore_install
+  [ -f "$SK/.install-op/lock.db" ]
   [ -f "$SK/run/install.db" ]
   [ -f "$SK/scripts/team.sh" ]
 
   HOME="$FAKE_HOME" bash "$REPO_ROOT/uninstall.sh" --yes
 
-  [ -f "$SK/run/install-op.lock.db" ]
+  [ -f "$SK/.install-op/lock.db" ]
   [ ! -e "$SK/run/install.db" ]
   [ ! -e "$SK/run/install-manifest.json" ]
   [ ! -e "$SK/scripts" ]
   [ ! -e "$SK/SKILL.md" ]
+  # no link (dangling or not) is left behind; the lock directory is all that stays
+  [ ! -L "$SK/run" ]
+  [ "$(ls -A "$SK")" = .install-op ]
 }
 
 @test "uninstall preserves recovery through removal and cannot delete a later install entrypoint" {
@@ -2904,14 +3373,14 @@ CYG
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'test_home="${AGMSG_TEST_INSTALL_LOCK_LOSS_DIR%/lock-loss}"' \
-    'lock_db="$test_home/.agents/skills/agmsg/run/install-op.lock.db"' \
+    'lock_db="$test_home/.agents/skills/agmsg/.install-op/lock.db"' \
     'if [ "${1:-}" = "$lock_db" ]; then printf "%s\\n" "$$" > "$AGMSG_TEST_INSTALL_LOCK_LOSS_DIR/lock.pid"; fi' \
     "exec $sqlite_q \"\$@\"" > "$bin/sqlite3"
   chmod +x "$bin/sqlite3"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'test_home="${AGMSG_TEST_INSTALL_LOCK_LOSS_DIR%/lock-loss}"' \
-    'lock_db="$test_home/.agents/skills/agmsg/run/install-op.lock.db"' \
+    'lock_db="$test_home/.agents/skills/agmsg/.install-op/lock.db"' \
     'target="$test_home/.agents/skills/agmsg/scripts"' \
     'final_root="$test_home/.agents/skills/agmsg/uninstall.sh"' \
     'final_retired="$test_home/.agents/skills/agmsg/.install-op-uninstaller-retired."' \
@@ -2941,7 +3410,7 @@ CYG
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'test_home="${AGMSG_TEST_INSTALL_LOCK_LOSS_DIR%/lock-loss}"' \
-    'lock_db="$test_home/.agents/skills/agmsg/run/install-op.lock.db"' \
+    'lock_db="$test_home/.agents/skills/agmsg/.install-op/lock.db"' \
     'source_path="$1"; dest_path="$2"' \
     'case "$source_path:$dest_path" in "$test_home/.agents/skills/agmsg/uninstall.sh:$test_home/.agents/skills/agmsg/.install-op-uninstaller-retired."*)' \
     '  if [ ! -e "$AGMSG_TEST_INSTALL_LOCK_LOSS_DIR/move-fired" ]; then' \
@@ -2985,7 +3454,7 @@ CYG
   # order. This injection stops immediately after removing scripts, so other
   # entries may legitimately remain if they sort after scripts.
   [ ! -e "$SK/scripts" ]
-  [ -f "$SK/run/install-op.lock.db" ]
+  [ -f "$SK/.install-op/lock.db" ]
   [ -x "$SK/uninstall.sh" ]
   [ -r "$SK/run/install-op-recovery.sh" ]
 

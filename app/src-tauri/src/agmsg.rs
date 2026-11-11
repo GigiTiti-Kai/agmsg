@@ -22,7 +22,7 @@ use tauri::{AppHandle, Emitter, Manager};
 /// matching a stray leftover directory from an earlier broken run instead
 /// of erroring outright). USERPROFILE is Windows' own always-set
 /// equivalent, set by the OS itself regardless of what launched the process.
-fn home_dir_string() -> Option<String> {
+pub(crate) fn home_dir_string() -> Option<String> {
     std::env::var("HOME").ok().or_else(|| std::env::var("USERPROFILE").ok())
 }
 
@@ -345,19 +345,21 @@ fn stores() -> Option<std::sync::Arc<Stores>> {
 /// own files have not changed.
 const TIMER_REUSE: Duration = Duration::from_secs(60);
 
+/// The timer's last whole look at the stores, with the teams' stamp it was made under.
+static TIMER_LAST: std::sync::Mutex<Option<(std::time::Instant, String, (Vec<PathBuf>, Vec<String>))>> = std::sync::Mutex::new(None);
+
 /// `watchable_stores` for the timer. Where the answer is kept (agmsg's own drivers) this is the same free call.
 /// Where it is not (an external driver in play), a fetch every ten seconds would start a bash on a timer, so the
 /// last look is reused for up to `TIMER_REUSE` while the list of teams and their config files look the same
 /// (a team added, removed or changed shows on the next tick); what only the driver's own code could notice is
 /// seen within that minute. Opening a folder does not use this: it always looks.
 fn watchable_stores_timed() -> (Vec<PathBuf>, Vec<String>) {
-    static LAST: std::sync::Mutex<Option<(std::time::Instant, String, (Vec<PathBuf>, Vec<String>))>> = std::sync::Mutex::new(None);
     let base = agmsg_base();
     if crate::store_fp::base_part(&base, &crate::store_fp::Env::from_process()).is_some() {
         return watchable_stores();
     }
     let stamp = crate::store_fp::teams_stamp(&base);
-    if let (Some(st), Some((at, was, answer))) = (&stamp, LAST.lock().unwrap().as_ref()) {
+    if let (Some(st), Some((at, was, answer))) = (&stamp, TIMER_LAST.lock().unwrap().as_ref()) {
         if was == st && at.elapsed() < TIMER_REUSE {
             return answer.clone();
         }
@@ -365,8 +367,8 @@ fn watchable_stores_timed() -> (Vec<PathBuf>, Vec<String>) {
     let (answer, whole) = watchable_stores_checked();
     match (stamp, whole) {
         // only a whole look is kept; a failed or partial one is asked for again on the next tick
-        (Some(st), true) => *LAST.lock().unwrap() = Some((std::time::Instant::now(), st, answer.clone())),
-        _ => *LAST.lock().unwrap() = None,
+        (Some(st), true) => *TIMER_LAST.lock().unwrap() = Some((std::time::Instant::now(), st, answer.clone())),
+        _ => *TIMER_LAST.lock().unwrap() = None,
     }
     answer
 }
@@ -562,6 +564,62 @@ const MESSAGES_SINCE_LEGACY_ONLY_SQL: &str = "\
      WHERE id > ?2
      ORDER BY at ASC, ord ASC";
 
+/// Ask the watcher to look for stores now instead of at the next rescan beat. Called after the app joins a member
+/// or sends a message: a team's store file can appear with its first message, and a store found late must not
+/// miss what was written before it was found.
+static RESCAN_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn request_rescan() {
+    // The timer may be reusing a look made before this store existed (a team whose store is created by its first
+    // message has the same config files before and after): drop it, so the look the rescan makes is a fresh one.
+    *TIMER_LAST.lock().unwrap() = None;
+    RESCAN_NOW.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Where to begin reading a store the watcher has just opened. A store that was there when the app started begins
+/// at its current end (the room loads its history itself, and replaying it would also type old messages into
+/// panes). A store that did not exist then is new: it is read from its start, so rows written before it was found
+/// are not lost. This is decided by what existed, never by a row's own time, which an imported message keeps from
+/// its origin.
+fn start_reading(conn: &rusqlite::Connection, new_store: bool) -> Cursors {
+    if new_store {
+        Cursors::default()
+    } else {
+        Cursors {
+            seq: conn.query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |r| r.get(0)).unwrap_or(0),
+            legacy_id: conn.query_row("SELECT COALESCE(MAX(id),0) FROM messages", [], |r| r.get(0)).unwrap_or(0),
+        }
+    }
+}
+
+/// Whether a store file the watcher is opening is new since the app started, and why that was decided. A file
+/// present at the first look is not new. Otherwise its creation time decides, for the first look as well as later
+/// ones: created at or after the app started (with 2 s of slack: a file made up to 2 s before the start counts as new) is new, so a team's store
+/// made while the first look is still running keeps its first row. Where the system gives no creation time the
+/// answer is "new" for a later look (the file was not in the first look) and "not new" for the first look (the
+/// file was there when the app began), and the reason says so; the log carries it.
+fn is_new_store(
+    path: &std::path::Path,
+    present_at_start: &std::collections::HashSet<PathBuf>,
+    started: std::time::SystemTime,
+    first_scan: bool,
+) -> (bool, &'static str) {
+    if present_at_start.contains(path) {
+        return (false, "present at the first look");
+    }
+    match std::fs::metadata(path).and_then(|m| m.created()) {
+        Ok(t) => {
+            if t + Duration::from_secs(2) >= started {
+                (true, "created since the app started")
+            } else {
+                (false, "created before the app started")
+            }
+        }
+        Err(_) if first_scan => (false, "no creation time; treated as there at startup"),
+        Err(_) => (true, "no creation time; not in the first look, treated as new"),
+    }
+}
+
 /// Where each of the two id spaces has been read up to.
 #[derive(Clone, Copy, Default)]
 struct Cursors {
@@ -650,9 +708,8 @@ fn open_ro(path: &std::path::Path) -> Result<rusqlite::Connection, String> {
 /// messages arrive through `api.sh` like everyone's history does.
 /// Live updates for a team the app cannot read directly, via `api.sh`.
 ///
-/// Returns the messages after `last_seen` and the new watermark. `last_seen`
-/// is `None` the first time a team is seen, and then nothing is emitted —
-/// only the watermark is taken. The room loads its own history; replaying it
+/// Returns the messages after `last_seen`, the new watermark, and whether the look worked at all. The first
+/// successful look (`looked_before` false) emits nothing — only the watermark is taken. The room loads its own history; replaying it
 /// here would duplicate everything already on screen.
 ///
 /// Ids are opaque, so "after" cannot be a comparison. The list arrives
@@ -661,14 +718,15 @@ fn open_ro(path: &std::path::Path) -> Result<rusqlite::Connection, String> {
 /// more than `limit` messages arrived between polls — the tail is emitted
 /// rather than nothing, since dropping messages silently is the failure this
 /// whole branch exists to remove.
-fn fallback_new_messages(team: &str, last_seen: Option<&str>) -> (Vec<Message>, Option<String>) {
+fn fallback_new_messages(team: &str, last_seen: Option<&str>, looked_before: bool) -> (Vec<Message>, Option<String>, bool) {
     const WINDOW: usize = 50;
     let raw = match run_script(
         "api.sh",
         &["get", "teams", team, "messages", "--limit", "50"],
     ) {
         Ok(raw) => raw,
-        Err(_) => return (Vec::new(), last_seen.map(str::to_string)),
+        // not a look: the caller keeps its state and asks again
+        Err(_) => return (Vec::new(), last_seen.map(str::to_string), false),
     };
     let all: Vec<Message> = parse_jsonl::<ApiMessage>(&raw)
         .into_iter()
@@ -683,8 +741,14 @@ fn fallback_new_messages(team: &str, last_seen: Option<&str>) -> (Vec<Message>, 
         .collect();
 
     let watermark = all.last().map(|m| m.id.clone()).or(last_seen.map(str::to_string));
+    // The first look only sets the baseline (what is already there is history). A later look that has nothing to
+    // compare with because the first one found the team empty has no baseline row to find, so everything it sees
+    // is new.
+    if !looked_before {
+        return (Vec::new(), watermark, true);
+    }
     let Some(last_seen) = last_seen else {
-        return (Vec::new(), watermark);
+        return (all, watermark, true);
     };
     let fresh = match all.iter().position(|m| m.id == last_seen) {
         Some(i) => all[i + 1..].to_vec(),
@@ -693,7 +757,7 @@ fn fallback_new_messages(team: &str, last_seen: Option<&str>) -> (Vec<Message>, 
         None => all,
     };
     debug_assert!(fresh.len() <= WINDOW);
-    (fresh, watermark)
+    (fresh, watermark, true)
 }
 
 fn watchable_stores() -> (Vec<PathBuf>, Vec<String>) {
@@ -786,6 +850,8 @@ pub struct AgentType {
     /// prompt is passed positionally (claude-code). Mirrors the prompt half
     /// of scripts/lib/boot-command.sh's agmsg_role_cli_args.
     pub prompt_arg: Option<String>,
+    /// The flag that carries a model name (manifest `model_arg=`), when the CLI takes one.
+    pub model_arg: Option<String>,
 }
 
 /// Read one key from a type.conf manifest (read-only key=value data, never
@@ -887,7 +953,8 @@ pub fn agmsg_spawnable_types() -> Result<Vec<AgentType>, String> {
             let options = spawn_options_tokens(&name);
             let cmd_prefix = manifest_get(&conf, "cmd_prefix");
             let prompt_arg = manifest_get(&conf, "prompt_arg");
-            types.push(AgentType { name, cli, options, cmd_prefix, prompt_arg });
+            let model_arg = manifest_get(&conf, "model_arg").filter(|m| !m.is_empty());
+            types.push(AgentType { name, cli, options, cmd_prefix, prompt_arg, model_arg });
         }
     }
     types.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1005,6 +1072,36 @@ fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
+/// Orderable form of a version: "X.Y.Z" plus its pre-release, so that an
+/// installed release candidate sorts BELOW the release it precedes
+/// (1.7.0-rc.1 < 1.7.0). Only an explicit alpha/beta/rc tag counts as a
+/// pre-release; git-describe suffixes ("-3-gabc1234", "-dirty") and build
+/// metadata keep comparing equal to their base X.Y.Z, as before.
+/// The last three fields order the pre-release: (is_release, tag rank, number).
+fn parse_version(s: &str) -> Option<(u64, u64, u64, u8, u8, u64)> {
+    let (major, minor, patch) = parse_semver(s)?;
+    let s = s.trim().trim_start_matches('v');
+    let s = s.split('+').next().unwrap_or(s);
+    let pre = s.split_once('-').map(|(_, rest)| rest).unwrap_or("");
+    let tag = pre.split(['.', '-']).next().unwrap_or("");
+    let (rank, rest) = if let Some(r) = tag.strip_prefix("alpha") {
+        (0u8, r)
+    } else if let Some(r) = tag.strip_prefix("beta") {
+        (1, r)
+    } else if let Some(r) = tag.strip_prefix("rc") {
+        (2, r)
+    } else {
+        return Some((major, minor, patch, 1, 0, 0));
+    };
+    // "rc.2" and "rc2" both carry the number; a bare "rc" is number 0.
+    let num = if rest.is_empty() {
+        pre.split(['.', '-']).nth(1).and_then(|n| n.parse().ok()).unwrap_or(0)
+    } else {
+        rest.parse().unwrap_or(0)
+    };
+    Some((major, minor, patch, 0, rank, num))
+}
+
 #[derive(Serialize)]
 pub struct CoreVersionStatus {
     installed: Option<String>,
@@ -1045,8 +1142,8 @@ pub fn agmsg_core_version_status() -> CoreVersionStatus {
     let pinned = pinned_core_version();
     let installed = read_installed_core_version();
 
-    let outdated = match (&installed, parse_semver(&pinned)) {
-        (Some(v), Some(pinned_v)) => match parse_semver(v) {
+    let outdated = match (&installed, parse_version(&pinned)) {
+        (Some(v), Some(pinned_v)) => match parse_version(v) {
             Some(installed_v) => installed_v < pinned_v,
             None => true,
         },
@@ -1164,6 +1261,10 @@ fn run_script(name: &str, args: &[&str]) -> Result<String, String> {
     let output = bash_command()?
         .arg(bash_path(&script))
         .args(args)
+        // The app is not a seat. Core's self-naming (a seat names its own terminal pane when it sends or reads)
+        // would otherwise ask the terminal the app was started from, which costs about two seconds per send when
+        // that terminal is herdr or tmux, and can bind the sending member to that pane.
+        .env("AGMSG_SELF_NAME", "off")
         .output()
         .map_err(|e| e.to_string())?;
     if output.status.success() {
@@ -1177,7 +1278,11 @@ fn run_script(name: &str, args: &[&str]) -> Result<String, String> {
 /// app-user identity; it must already be a member of `team`.
 #[tauri::command]
 pub fn agmsg_send(team: String, from: String, to: String, body: String) -> Result<(), String> {
-    run_script("send.sh", &[&team, &from, &to, &body]).map(|_| ())
+    let r = run_script("send.sh", &[&team, &from, &to, &body]).map(|_| ());
+    if r.is_ok() {
+        request_rescan();
+    }
+    r
 }
 
 /// The installed agmsg slash-command name (basename of the skill dir). Used to
@@ -1228,7 +1333,11 @@ pub fn agmsg_join(
     let project = msys_to_native(&project);
     std::fs::create_dir_all(&project).map_err(|e| e.to_string())?;
     let project = bash_path(std::path::Path::new(&project));
-    run_script("join.sh", &[&team, &name, &agent_type, &project]).map(|_| ())
+    let r = run_script("join.sh", &[&team, &name, &agent_type, &project]).map(|_| ());
+    if r.is_ok() {
+        request_rescan();
+    }
+    r
 }
 
 /// Rename a member in a team (updates team config + rewrites message history).
@@ -1301,79 +1410,167 @@ pub fn agmsg_delivery_mode(agent_type: String, project: String) -> Result<String
     Ok("off".to_string())
 }
 
+/// What the watcher knows between two ticks. Split from the thread so a tick can be run (and tested) without a
+/// window: `step` returns the messages to emit.
+struct Watcher {
+    // One open connection and cursor pair per store, keyed by path.
+    open: Vec<(PathBuf, rusqlite::Connection, Cursors)>,
+    started: std::time::SystemTime,
+    // Store files that existed at the first look.
+    present_at_start: std::collections::HashSet<PathBuf>,
+    // Re-enumerating costs a subprocess per team, so it happens on a much slower beat than the poll. `join`
+    // creating a team is an ordinary action, though, so it cannot be startup-only: "I joined and the app never
+    // showed it, until I restarted" is a bug report nobody can diagnose.
+    ticks_until_rescan: u32,
+    first_scan: bool,
+    // Teams the app cannot read directly: how far each has been read, and whether a look has worked yet. Polled on
+    // the rescan beat, not the fast one: this path costs a subprocess per team per poll.
+    via_api: Vec<(String, Option<String>, bool)>,
+    // Ids the last look through api.sh gave, in this step, for a team that has just become directly readable, so
+    // the direct reader (which starts at the store's end) does not emit them a second time in the same step.
+    handed_over: std::collections::HashSet<(String, String)>,
+}
+
+impl Watcher {
+    fn new() -> Self {
+        Watcher {
+            open: Vec::new(),
+            started: std::time::SystemTime::now(),
+            present_at_start: std::collections::HashSet::new(),
+            ticks_until_rescan: 0,
+            first_scan: true,
+            via_api: Vec::new(),
+            handed_over: std::collections::HashSet::new(),
+        }
+    }
+
+    fn step(&mut self) -> Vec<Message> {
+        let mut out = Vec::new();
+        if RESCAN_NOW.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.ticks_until_rescan = 0;
+        }
+        if self.ticks_until_rescan == 0 {
+            self.ticks_until_rescan = 12; // ~10s at the poll interval
+            let (direct, fallback) = watchable_stores_timed();
+            // Teams whose store can now be read directly are leaving the api.sh list. Their direct reader starts at
+            // the store's end, so the rows after the api.sh watermark come from one last api.sh look made after
+            // the store is open. The handoff is committed only if all of that worked: every new store opened and
+            // every last look succeeded. Otherwise nothing changes (the teams stay on api.sh with their
+            // watermarks, the stores just opened are dropped) and the next rescan tries again.
+            let leaving: Vec<String> =
+                self.via_api.iter().filter(|(t, _, looked)| *looked && !fallback.contains(t)).map(|(t, _, _)| t.clone()).collect();
+            for team in &fallback {
+                if !self.via_api.iter().any(|(t, _, _)| t == team) {
+                    self.via_api.push((team.clone(), None, false));
+                }
+            }
+            // what this beat's ordinary look gave for a team that is leaving: the direct reader may see it too
+            let mut polled_leaving: Vec<(String, String)> = Vec::new();
+            for (team, seen, looked) in self.via_api.iter_mut() {
+                let (fresh, watermark, ok) = fallback_new_messages(team, seen.as_deref(), *looked);
+                *seen = watermark;
+                *looked = *looked || ok;
+                if leaving.contains(team) {
+                    polled_leaving.extend(fresh.iter().map(|m| (m.team.clone(), m.id.clone())));
+                }
+                out.extend(fresh);
+            }
+            // stores to open now, not yet part of the watcher
+            let mut staged: Vec<(PathBuf, rusqlite::Connection, Cursors, bool, &'static str)> = Vec::new();
+            let mut open_failed = false;
+            for path in direct {
+                if self.open.iter().any(|(p, _, _)| p == &path) {
+                    continue;
+                }
+                match open_ro(&path) {
+                    Ok(conn) => {
+                        let (new_store, why) = is_new_store(&path, &self.present_at_start, self.started, self.first_scan);
+                        let cursors = start_reading(&conn, new_store);
+                        staged.push((path, conn, cursors, new_store, why));
+                    }
+                    Err(_) => open_failed = true,
+                }
+            }
+            let mut last_looks: Vec<Message> = Vec::new();
+            let mut handoff_ok = !(open_failed && !leaving.is_empty());
+            if handoff_ok {
+                for team in &leaving {
+                    let seen = self.via_api.iter().find(|(t, _, _)| t == team).and_then(|(_, s, _)| s.clone());
+                    let (fresh, _, ok) = fallback_new_messages(team, seen.as_deref(), true);
+                    if !ok {
+                        handoff_ok = false;
+                        break;
+                    }
+                    last_looks.extend(fresh);
+                }
+            }
+            if leaving.is_empty() || handoff_ok {
+                for (path, conn, cursors, new_store, why) in staged {
+                    if new_store {
+                        eprintln!("[agmsg-app] watcher opened a new store and reads it from its start ({why})");
+                    } else if why.starts_with("no creation time") {
+                        eprintln!("[agmsg-app] watcher opened a store at its end ({why})");
+                    }
+                    if self.first_scan {
+                        self.present_at_start.insert(path.clone());
+                    }
+                    self.open.push((path, conn, cursors));
+                }
+                if !leaving.is_empty() {
+                    self.via_api.retain(|(t, _, _)| !leaving.contains(t));
+                    self.handed_over.extend(polled_leaving);
+                    for m in last_looks {
+                        self.handed_over.insert((m.team.clone(), m.id.clone()));
+                        out.push(m);
+                    }
+                }
+            } else {
+                eprintln!("[agmsg-app] handoff from api.sh to the direct reader not done ({} team(s)); trying again at the next rescan", leaving.len());
+            }
+        }
+        self.ticks_until_rescan -= 1;
+        self.first_scan = false;
+
+        // A read failure is transient here (a WAL checkpoint, a store being recreated), not a reason to end the
+        // thread — the previous version returned on a prepare error and the session went silently dead for the
+        // rest of its life.
+        for (_, conn, cursors) in self.open.iter_mut() {
+            if let Ok(new_rows) = read_new_messages(conn, cursors) {
+                out.extend(new_rows);
+            }
+        }
+        if !self.handed_over.is_empty() {
+            // a row both readers saw is emitted once: the handed-over copy is already in `out` from the look
+            let mut seen_here = std::collections::HashSet::new();
+            out.retain(|m| {
+                let key = (m.team.clone(), m.id.clone());
+                !self.handed_over.contains(&key) || seen_here.insert(key)
+            });
+            self.handed_over.clear();
+        }
+        out
+    }
+}
+
+/// One message to the window, with a log line (id, team, recipient, created_at, wall-clock ms) so the time it was
+/// stored, emitted and typed can be lined up.
+fn emit_message(app: &AppHandle, m: Message) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    eprintln!("[agmsg-app] emit message {} {} -> {} in {} (created {}) at {now} ms", m.id, m.from, m.to, m.team, m.created_at);
+    let _ = app.emit("agmsg-message", m);
+}
+
 /// Poll the DB for new rows and emit each as an `agmsg-message` event so the
 /// team room updates live (and so spawned panes can be fed via stdin-inject).
 pub fn start_watcher(app: AppHandle) {
     thread::spawn(move || {
-        // agmsg may not be installed yet at startup — the first-run flow
-        // installs it (and creates the DB) after this thread has already
-        // started. Retry instead of giving up once, so that session isn't
-        // permanently missing live updates and stdin-inject delivery.
-        // One open connection and cursor pair per store, keyed by path.
-        let mut open: Vec<(PathBuf, rusqlite::Connection, Cursors)> = Vec::new();
-        // Re-enumerating costs a subprocess per team, so it happens on a much
-        // slower beat than the poll. `join` creating a team is an ordinary
-        // action, though, so it cannot be startup-only: "I joined and the app
-        // never showed it, until I restarted" is a bug report nobody can
-        // diagnose.
-        let mut ticks_until_rescan = 0u32;
-        // Teams the app cannot read directly, and how far each has been read.
-        // Polled on the rescan beat, not the fast one: this path costs a
-        // subprocess per team per poll.
-        let mut via_api: Vec<(String, Option<String>)> = Vec::new();
-
+        // agmsg may not be installed yet at startup — the first-run flow installs it (and creates the DB) after
+        // this thread has already started. A tick that finds nothing is retried on the next one, so that session
+        // isn't permanently missing live updates and stdin-inject delivery.
+        let mut watcher = Watcher::new();
         loop {
-            if ticks_until_rescan == 0 {
-                ticks_until_rescan = 12; // ~10s at the poll interval below
-                let (direct, fallback) = watchable_stores_timed();
-                for team in fallback {
-                    if !via_api.iter().any(|(t, _)| t == &team) {
-                        via_api.push((team, None));
-                    }
-                }
-                for (team, seen) in via_api.iter_mut() {
-                    let (fresh, watermark) = fallback_new_messages(team, seen.as_deref());
-                    *seen = watermark;
-                    for m in fresh {
-                        let _ = app.emit("agmsg-message", m);
-                    }
-                }
-                for path in direct {
-                    if open.iter().any(|(p, _, _)| p == &path) {
-                        continue;
-                    }
-                    if let Ok(conn) = open_ro(&path) {
-                        // Start at the current end of both id spaces: the room
-                        // loads its own history separately, so replaying it
-                        // here would double every message already on screen.
-                        let cursors = Cursors {
-                            seq: conn
-                                .query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |r| {
-                                    r.get(0)
-                                })
-                                .unwrap_or(0),
-                            legacy_id: conn
-                                .query_row("SELECT COALESCE(MAX(id),0) FROM messages", [], |r| {
-                                    r.get(0)
-                                })
-                                .unwrap_or(0),
-                        };
-                        open.push((path, conn, cursors));
-                    }
-                }
-            }
-            ticks_until_rescan -= 1;
-
-            // A read failure is transient here (a WAL checkpoint, a store
-            // being recreated), not a reason to end the thread — the previous
-            // version returned on a prepare error and the session went
-            // silently dead for the rest of its life.
-            for (_, conn, cursors) in open.iter_mut() {
-                if let Ok(new_rows) = read_new_messages(conn, cursors) {
-                    for m in new_rows {
-                        let _ = app.emit("agmsg-message", m);
-                    }
-                }
+            for m in watcher.step() {
+                emit_message(&app, m);
             }
             thread::sleep(Duration::from_millis(800));
         }
@@ -1383,7 +1580,7 @@ pub fn start_watcher(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        agmsg_base, msys_to_native, parse_semver, pinned_core_version, run_script,
+        agmsg_base, msys_to_native, parse_semver, parse_version, pinned_core_version, run_script,
         protected_locations, running_core_version, store_info, to_bash_slashes, watchable_stores,
         fetch_stores_in_one_process, note_batch_failure, parse_stores, watchable_stores_timed, BATCH_LOG,
     };
@@ -1495,6 +1692,27 @@ mod tests {
         assert!(parse_semver("1.1.10") > parse_semver("1.1.9"));
         assert!(parse_semver("1.1.4") < parse_semver("1.2.0"));
         assert!(parse_semver("1.1.4") < parse_semver("2.0.0"));
+    }
+
+    #[test]
+    fn release_candidate_sorts_below_its_release() {
+        assert!(parse_version("1.7.0-rc.1") < parse_version("1.7.0"));
+        assert!(parse_version("v1.7.0-rc.1") < parse_version("1.7.0"));
+        assert!(parse_version("1.7.0-rc.2") < parse_version("1.7.0-rc.10"));
+        assert!(parse_version("1.7.0-rc2") < parse_version("1.7.0-rc10"));
+        assert!(parse_version("1.7.0-alpha.1") < parse_version("1.7.0-beta.1"));
+        assert!(parse_version("1.7.0-beta.3") < parse_version("1.7.0-rc.1"));
+        // An rc of the next release is still newer than the previous release.
+        assert!(parse_version("1.6.9") < parse_version("1.7.0-rc.1"));
+        assert!(parse_version("1.7.0") > parse_version("1.7.0-rc.9"));
+    }
+
+    #[test]
+    fn describe_suffixes_and_build_metadata_are_not_pre_releases() {
+        assert_eq!(parse_version("1.7.0-3-gabc1234"), parse_version("1.7.0"));
+        assert_eq!(parse_version("1.7.0-dirty"), parse_version("1.7.0"));
+        assert_eq!(parse_version("1.7.0+build.5"), parse_version("1.7.0"));
+        assert_eq!(parse_version("unknown"), None);
     }
 
     // --- command-layer harness (fake agmsg-core scripts) ---
@@ -1991,6 +2209,18 @@ printf '{"team":"%s","driver":"sqlite","partition":"x","path":"%s","exists":%s}\
         assert_eq!(agmsg_base(), dir.path());
     }
 
+    /// Every script the app runs is told not to self-name, whatever the app's own environment says.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    #[serial]
+    fn scripts_run_by_the_app_are_told_not_to_name_a_terminal_pane() {
+        let _b = fake_base(&[("probe.sh", "printf '%s' \"${AGMSG_SELF_NAME-unset}\"\n")]);
+        let _on = EnvGuard::set("AGMSG_SELF_NAME", "on");
+        assert_eq!(run_script("probe.sh", &[]).unwrap(), "off", "the app's own setting does not reach the script");
+        drop(_on);
+        assert_eq!(run_script("probe.sh", &[]).unwrap(), "off");
+    }
+
     #[test]
     #[serial]
     fn scripts_dir_is_the_scripts_folder_of_the_base_in_use() {
@@ -2023,6 +2253,23 @@ printf '{"team":"%s","driver":"sqlite","partition":"x","path":"%s","exists":%s}\
         // user would actually act on.
         std::fs::write(dir.path().join("VERSION"), "9.9.9\n").unwrap();
         assert_eq!(running_core_version(), "9.9.9");
+    }
+
+    #[test]
+    #[serial]
+    fn an_installed_release_candidate_is_offered_the_matching_release() {
+        // #1845: the pinned core is a release; an installed rc of it must be outdated,
+        // the release itself must not be, and a describe-suffixed build stays as before.
+        let dir = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("AGMSG_APP_BASE", &dir.path().to_string_lossy());
+        let pinned = pinned_core_version();
+        let status = |installed: &str| {
+            std::fs::write(dir.path().join("VERSION"), format!("{installed}\n")).unwrap();
+            super::agmsg_core_version_status().outdated
+        };
+        assert!(status(&format!("{pinned}-rc.1")), "rc install of the pinned release is outdated");
+        assert!(!status(&pinned), "the release itself is current");
+        assert!(!status(&format!("{pinned}-3-gabc1234")), "a describe build is not outdated");
     }
 
     #[test]
@@ -2196,6 +2443,89 @@ printf '{"team":"%s","driver":"sqlite","partition":"x","path":"%s","exists":%s}\
     /// It exercises the watcher's own reader, not a copy of its SQL.
     #[test]
     #[serial]
+    fn a_new_store_is_read_from_its_start_whatever_the_rows_own_time_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("AGMSG_APP_BASE", &dir.path().to_string_lossy());
+        // An imported row keeps its origin's time, so it can look old (or skewed) to this machine.
+        store_with(
+            dir.path(),
+            &[
+                ("019faa2a-0000-7000-8000-000000000001", "2001-01-01T00:00:00Z"),
+                ("019faa2a-0000-7000-8000-000000000002", "2026-07-28T10:00:06Z"),
+            ],
+            &[],
+        );
+        let conn = super::open_ro(&dir.path().join("db/messages.db")).expect("open");
+        let mut cursors = super::start_reading(&conn, true);
+        let got = super::read_new_messages(&conn, &mut cursors).expect("read");
+        assert_eq!(got.len(), 2, "found late: every row is emitted, old origin time or not");
+        assert!(super::read_new_messages(&conn, &mut cursors).expect("read").is_empty(), "and each once");
+        // A row that arrives afterwards with an old origin time is still emitted.
+        add_linked(dir.path(), "019faa2a-0000-7000-8000-00000000000c", "2001-01-01T00:00:01Z", None);
+        let later = super::read_new_messages(&conn, &mut cursors).expect("read");
+        assert_eq!(later.len(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn a_store_that_existed_at_startup_begins_at_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("AGMSG_APP_BASE", &dir.path().to_string_lossy());
+        store_with(dir.path(), &[("019faa2a-0000-7000-8000-000000000001", "2026-07-28T10:00:05Z")], &[]);
+        let conn = super::open_ro(&dir.path().join("db/messages.db")).expect("open");
+        let mut cursors = super::start_reading(&conn, false);
+        assert!(super::read_new_messages(&conn, &mut cursors).expect("read").is_empty());
+        add_linked(dir.path(), "019faa2a-0000-7000-8000-00000000000d", "2001-01-01T00:00:01Z", None);
+        assert_eq!(super::read_new_messages(&conn, &mut cursors).expect("read").len(), 1, "a later row with an old origin time is emitted");
+    }
+
+    #[test]
+    fn a_file_made_while_the_first_look_runs_is_new_but_one_present_at_the_first_look_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("messages.db");
+        let started = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
+        std::fs::write(&f, b"").unwrap(); // created after `started`
+        let mut present = std::collections::HashSet::new();
+        // First look, file born after the app started: new, so its first row is kept.
+        assert_eq!(super::is_new_store(&f, &present, started, true).0, true);
+        // A later look: new as well.
+        assert_eq!(super::is_new_store(&f, &present, started, false).0, true);
+        // Present at the first look: never new.
+        present.insert(f.clone());
+        assert_eq!(super::is_new_store(&f, &present, started, false).0, false);
+        // Born long before the app started: not new, at either look.
+        present.clear();
+        let later_start = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        assert_eq!(super::is_new_store(&f, &present, later_start, true).0, false);
+        assert_eq!(super::is_new_store(&f, &present, later_start, false).0, false);
+    }
+
+    #[test]
+    #[serial]
+    fn a_store_created_during_the_first_look_with_its_first_row_already_in_it_keeps_that_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+        let _env = EnvGuard::set("AGMSG_APP_BASE", &dir.path().to_string_lossy());
+        store_with(dir.path(), &[("019faa2a-0000-7000-8000-000000000001", "2026-07-28T10:00:06Z")], &[]);
+        let path = dir.path().join("db/messages.db");
+        let (new_store, _) = super::is_new_store(&path, &Default::default(), started, true);
+        let conn = super::open_ro(&path).expect("open");
+        let mut cursors = super::start_reading(&conn, new_store);
+        assert_eq!(super::read_new_messages(&conn, &mut cursors).expect("read").len(), 1);
+    }
+
+    #[test]
+    fn a_missing_creation_time_is_decided_by_the_look_and_says_so() {
+        // The reason strings are what the log shows; a path that does not exist has no creation time.
+        let nowhere = std::path::Path::new("/nonexistent/agmsg/messages.db");
+        let present = Default::default();
+        let now = std::time::SystemTime::now();
+        assert_eq!(super::is_new_store(nowhere, &present, now, true), (false, "no creation time; treated as there at startup"));
+        assert_eq!(super::is_new_store(nowhere, &present, now, false), (true, "no creation time; not in the first look, treated as new"));
+    }
+
+    #[test]
+    #[serial]
     fn a_sent_message_reaches_the_app_from_both_the_event_log_and_the_legacy_table() {
         let dir = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set("AGMSG_APP_BASE", &dir.path().to_string_lossy());
@@ -2330,12 +2660,13 @@ echo '{"type":"message_sent","id":"m2","team":"alpha","from":"a","to":"b","body"
 
         // First sight takes a watermark and emits nothing — the room loads
         // its own history.
-        let (fresh, mark) = super::fallback_new_messages("alpha", None);
+        let (fresh, mark, ok) = super::fallback_new_messages("alpha", None, false);
+        assert!(ok);
         assert!(fresh.is_empty(), "history must not be replayed as live");
         assert_eq!(mark.as_deref(), Some("m2"));
 
         // A message the app has not seen is delivered.
-        let (fresh, mark) = super::fallback_new_messages("alpha", Some("m1"));
+        let (fresh, mark, _) = super::fallback_new_messages("alpha", Some("m1"), true);
         assert_eq!(
             fresh.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(),
             vec!["second"],
@@ -2343,7 +2674,7 @@ echo '{"type":"message_sent","id":"m2","team":"alpha","from":"a","to":"b","body"
         assert_eq!(mark.as_deref(), Some("m2"));
 
         // Nothing new means nothing emitted.
-        let (fresh, _) = super::fallback_new_messages("alpha", Some("m2"));
+        let (fresh, _, _) = super::fallback_new_messages("alpha", Some("m2"), true);
         assert!(fresh.is_empty(), "already-seen rows must not be re-emitted");
     }
 
@@ -2357,5 +2688,292 @@ echo '{"type":"message_sent","id":"m2","team":"alpha","from":"a","to":"b","body"
             r#"echo '{"team":"alpha","driver":"sqlite","partition":"shared","path":"/x/db.sqlite","exists":false}'"#,
         )]);
         assert_eq!(super::direct_store_path("alpha"), None);
+    }
+
+    /// A team that was empty at the first look has no baseline row: what shows up later is all new, not taken as
+    /// the baseline (that swallowed a team's first message).
+    #[test]
+    #[serial]
+    fn a_first_look_that_found_the_team_empty_does_not_swallow_the_first_message() {
+        let _base = fake_base(&[(
+            "api.sh",
+            r#"B="$(cd "$(dirname "$0")/.." && pwd)"
+[ -f "$B/has-message" ] && echo '{"type":"message_sent","id":"m1","team":"alpha","from":"a","to":"b","body":"first","at":"t1"}'
+exit 0
+"#,
+        )]);
+        let (fresh, mark, ok) = super::fallback_new_messages("alpha", None, false);
+        assert!(fresh.is_empty() && mark.is_none() && ok);
+        let root = super::agmsg_base();
+        std::fs::write(root.join("has-message"), "").unwrap();
+        let (fresh, mark, _) = super::fallback_new_messages("alpha", mark.as_deref(), true);
+        assert_eq!(fresh.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), vec!["first"]);
+        assert_eq!(mark.as_deref(), Some("m1"));
+    }
+
+    /// A look that failed is not a look: the next success is still the baseline, so history is not replayed.
+    #[test]
+    #[serial]
+    fn a_failed_look_is_not_counted_as_the_first_look() {
+        let _base = fake_base(&[("api.sh", "exit 1\n")]);
+        let (fresh, mark, ok) = super::fallback_new_messages("alpha", None, false);
+        assert!(fresh.is_empty() && mark.is_none() && !ok);
+    }
+
+    #[cfg(unix)]
+    fn write_first_message(store: &std::path::Path) {
+        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(store).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, team TEXT NOT NULL,
+               from_agent TEXT NOT NULL, to_agent TEXT NOT NULL, body TEXT NOT NULL,
+               created_at TEXT NOT NULL, read_at TEXT);
+             INSERT INTO messages(team,from_agent,to_agent,body,created_at)
+               VALUES ('a','white','chess','e2e4','2026-06-01T00:00:00Z');",
+        )
+        .unwrap();
+    }
+
+    /// A team joined with no store, its first message written (which creates the store), is emitted within one
+    /// normal rescan on the usual configuration.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn the_first_message_of_a_team_without_a_store_is_emitted_within_one_rescan() {
+        let base = real_base();
+        let store = add_real_team(&base, "a", "{}", false);
+        super::request_rescan(); // the timer's last look is shared by every test: start without it
+        let mut w = super::Watcher::new();
+        assert!(w.step().is_empty());
+        write_first_message(&store);
+        let mut got = Vec::new();
+        for _ in 0..13 {
+            got.extend(w.step());
+        }
+        assert_eq!(got.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), vec!["e2e4"], "once, not twice");
+    }
+
+    /// Where the timer reuses its last look (an external plugin dir is in play), a rescan requested after the
+    /// app's own send or join makes the very next tick see the new store.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn a_requested_rescan_sees_the_new_store_on_the_next_tick_even_where_the_look_is_reused() {
+        let base = real_base();
+        let root = base.dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("plugins/p")).unwrap(); // the answer is not kept
+        let store = add_real_team(&base, "a", "{}", false);
+        super::request_rescan(); // the timer's last look is shared by every test: start without it
+        let mut w = super::Watcher::new();
+        assert!(w.step().is_empty());
+        write_first_message(&store);
+        super::request_rescan();
+        let got = w.step();
+        assert_eq!(got.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), vec!["e2e4"]);
+        // and it is not emitted a second time by the api.sh path the team was on before
+        super::request_rescan();
+        assert!(w.step().is_empty());
+    }
+
+    /// The timer's reused look is dropped by a requested rescan: a store made after that look is seen at once.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn a_requested_rescan_drops_the_look_the_timer_was_reusing() {
+        let base = real_base();
+        let root = base.dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("plugins/p")).unwrap(); // the answer is not kept
+        let store = add_real_team(&base, "a", "{}", false);
+        let first = watchable_stores_timed();
+        assert!(first.0.is_empty() && first.1 == vec!["a".to_string()], "{first:?}");
+        write_first_message(&store);
+        assert!(watchable_stores_timed().0.is_empty(), "within the minute the old look is reused");
+        super::request_rescan();
+        assert_eq!(watchable_stores_timed().0, vec![store]);
+    }
+
+    /// A store that existed before the app started, read only through api.sh and then readable directly: a row
+    /// written between the last api.sh look and the direct reader opening is emitted exactly once.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn a_row_between_the_last_api_look_and_the_direct_reader_is_emitted_once() {
+        let base = fake_base(&[(
+            "api.sh",
+            r#"B="$(cd "$(dirname "$0")/.." && pwd)"
+if [ "$*" = "get teams" ]; then echo '{"name":"a"}'; exit 0; fi
+if [ "$4" = "store" ]; then
+  if [ -f "$B/direct" ]; then echo "{\"team\":\"a\",\"driver\":\"sqlite\",\"partition\":\"shared\",\"path\":\"$B/db/messages.db\",\"exists\":true}"
+  else echo '{"team":"a","driver":"jsonl","partition":"per-team","path":"/x/a.jsonl","exists":true}'; fi
+  exit 0
+fi
+echo '{"type":"message_sent","id":"1","team":"a","from":"x","to":"y","body":"one","at":"t1"}'
+[ -f "$B/row2" ] && echo '{"type":"message_sent","id":"2","team":"a","from":"x","to":"y","body":"two","at":"t2"}'
+exit 0
+"#,
+        )]);
+        let root = super::agmsg_base();
+        let db = root.join("db/messages.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, team TEXT NOT NULL,
+               from_agent TEXT NOT NULL, to_agent TEXT NOT NULL, body TEXT NOT NULL,
+               created_at TEXT NOT NULL, read_at TEXT);
+             INSERT INTO messages(team,from_agent,to_agent,body,created_at) VALUES ('a','x','y','one','2026-06-01T00:00:00Z');",
+        )
+        .unwrap();
+        super::request_rescan(); // the timer's last look is shared by every test: start without it
+        let mut w = super::Watcher::new();
+        // the store was there before the app started
+        w.started = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        assert!(w.step().is_empty(), "the first look is the baseline");
+        conn.execute("INSERT INTO messages(team,from_agent,to_agent,body,created_at) VALUES ('a','x','y','two','2026-06-01T00:00:01Z')", []).unwrap();
+        std::fs::write(root.join("row2"), "").unwrap();
+        std::fs::write(root.join("direct"), "").unwrap();
+        super::request_rescan();
+        let mut got = w.step();
+        for _ in 0..13 {
+            got.extend(w.step());
+        }
+        assert_eq!(got.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), vec!["two"], "once, not lost and not twice");
+        drop(base);
+    }
+
+    /// api.sh whose `messages` answer is driven by files in the install: `n` counts the calls, row 2 shows from
+    /// call `row2at` on, and call `failat` fails. `store` answers jsonl (api.sh only) until `direct` exists, then
+    /// the sqlite path in `direct`'s content (`miss` = a path that does not exist).
+    #[cfg(unix)]
+    fn handoff_base() -> FakeBase {
+        fake_base(&[(
+            "api.sh",
+            r#"B="$(cd "$(dirname "$0")/.." && pwd)"
+if [ "$*" = "get teams" ]; then echo '{"name":"a"}'; exit 0; fi
+if [ "$4" = "store" ]; then
+  if [ -f "$B/direct" ]; then echo "{\"team\":\"a\",\"driver\":\"sqlite\",\"partition\":\"shared\",\"path\":\"$(cat "$B/direct")\",\"exists\":true}"
+  else echo '{"team":"a","driver":"jsonl","partition":"per-team","path":"/x/a.jsonl","exists":true}'; fi
+  exit 0
+fi
+n=$(cat "$B/n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$B/n"
+[ "$n" = "$(cat "$B/failat" 2>/dev/null)" ] && exit 1
+echo '{"type":"message_sent","id":"1","team":"a","from":"x","to":"y","body":"one","at":"t1"}'
+[ "$n" -ge "$(cat "$B/row2at" 2>/dev/null || echo 999)" ] && echo '{"type":"message_sent","id":"2","team":"a","from":"x","to":"y","body":"two","at":"t2"}'
+exit 0
+"#,
+        )])
+    }
+
+    #[cfg(unix)]
+    fn legacy_store(path: &std::path::Path, team: &str, rows: &[&str]) -> rusqlite::Connection {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, team TEXT NOT NULL,
+               from_agent TEXT NOT NULL, to_agent TEXT NOT NULL, body TEXT NOT NULL,
+               created_at TEXT NOT NULL, read_at TEXT);",
+        )
+        .unwrap();
+        for b in rows {
+            conn.execute("INSERT INTO messages(team,from_agent,to_agent,body,created_at) VALUES (?1,'x','y',?2,'2026-06-01T00:00:00Z')", [team, b]).unwrap();
+        }
+        conn
+    }
+
+    fn bodies(v: &[super::Message]) -> Vec<&str> {
+        v.iter().map(|m| m.body.as_str()).collect()
+    }
+
+    /// A last api.sh look that fails does not commit the handoff: the team stays on api.sh with its watermark and
+    /// the store just opened is dropped; the next rescan tries again and the row is emitted once.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn a_failed_last_look_keeps_the_team_on_api_sh_and_the_next_rescan_emits_the_row_once() {
+        let _base = handoff_base();
+        let root = super::agmsg_base();
+        let conn = legacy_store(&root.join("db/messages.db"), "a", &["one"]);
+        super::request_rescan(); // the timer's last look is shared by every test: start without it
+        let mut w = super::Watcher::new();
+        w.started = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        assert!(w.step().is_empty()); // call 1: the baseline
+        conn.execute("INSERT INTO messages(team,from_agent,to_agent,body,created_at) VALUES ('a','x','y','two','2026-06-01T00:00:01Z')", []).unwrap();
+        std::fs::write(root.join("row2at"), "3").unwrap(); // row 2 appears after this beat's ordinary look
+        std::fs::write(root.join("failat"), "3").unwrap(); // and the last look (call 3) fails
+        std::fs::write(root.join("direct"), root.join("db/messages.db").to_string_lossy().as_bytes()).unwrap();
+        super::request_rescan();
+        let first = w.step();
+        assert!(first.is_empty(), "nothing emitted, nothing committed: {:?}", bodies(&first));
+        assert_eq!(w.via_api.len(), 1, "still on api.sh");
+        assert!(w.open.is_empty(), "the store opened for the handoff is not kept");
+        let mut got = Vec::new();
+        for _ in 0..13 {
+            got.extend(w.step());
+        }
+        assert_eq!(bodies(&got), vec!["two"], "recovered, once");
+        assert!(w.via_api.is_empty() && w.open.len() == 1, "handed over at the retry");
+    }
+
+    /// The direct store cannot be opened: nothing changes, the team is still read through api.sh.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn a_direct_store_that_cannot_be_opened_leaves_the_team_on_api_sh() {
+        let _base = handoff_base();
+        let root = super::agmsg_base();
+        super::request_rescan(); // the timer's last look is shared by every test: start without it
+        let mut w = super::Watcher::new();
+        assert!(w.step().is_empty()); // baseline
+        std::fs::write(root.join("row2at"), "2").unwrap();
+        std::fs::write(root.join("direct"), root.join("db/missing.db").to_string_lossy().as_bytes()).unwrap();
+        super::request_rescan();
+        let got = w.step();
+        assert_eq!(bodies(&got), vec!["two"], "api.sh still delivers");
+        assert_eq!(w.via_api.len(), 1);
+        assert!(w.open.is_empty());
+    }
+
+    /// Ids are only unique per team (legacy stores each have an id 2): two teams handing off in one step lose
+    /// neither message, and an unrelated team's direct row with the same id is not taken for a duplicate.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn two_teams_handing_off_in_one_step_with_the_same_id_lose_neither_and_an_unrelated_row_survives() {
+        let _base = fake_base(&[(
+            "api.sh",
+            r#"B="$(cd "$(dirname "$0")/.." && pwd)"
+if [ "$*" = "get teams" ]; then printf '{"name":"a"}\n{"name":"b"}\n{"name":"c"}\n'; exit 0; fi
+t="$3"
+if [ "$4" = "store" ]; then
+  if [ "$t" = c ] || [ -f "$B/direct" ]; then echo "{\"team\":\"$t\",\"driver\":\"sqlite\",\"partition\":\"per-team\",\"path\":\"$B/db_$t/messages.db\",\"exists\":true}"
+  else echo "{\"team\":\"$t\",\"driver\":\"jsonl\",\"partition\":\"per-team\",\"path\":\"/x/$t.jsonl\",\"exists\":true}"; fi
+  exit 0
+fi
+echo "{\"type\":\"message_sent\",\"id\":\"1\",\"team\":\"$t\",\"from\":\"x\",\"to\":\"y\",\"body\":\"$t-one\",\"at\":\"t1\"}"
+[ -f "$B/row2" ] && echo "{\"type\":\"message_sent\",\"id\":\"2\",\"team\":\"$t\",\"from\":\"x\",\"to\":\"y\",\"body\":\"$t-two\",\"at\":\"t2\"}"
+exit 0
+"#,
+        )]);
+        let root = super::agmsg_base();
+        let stores: Vec<_> = ["a", "b", "c"].iter().map(|t| legacy_store(&root.join(format!("db_{t}/messages.db")), t, &[&format!("{t}-one")])).collect();
+        super::request_rescan(); // the timer's last look is shared by every test: start without it
+        let mut w = super::Watcher::new();
+        w.started = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        assert!(w.step().is_empty());
+        for (t, conn) in ["a", "b", "c"].iter().zip(&stores) {
+            conn.execute("INSERT INTO messages(team,from_agent,to_agent,body,created_at) VALUES (?1,'x','y',?2,'2026-06-01T00:00:01Z')", [*t, &format!("{t}-two")]).unwrap();
+        }
+        std::fs::write(root.join("row2"), "").unwrap();
+        std::fs::write(root.join("direct"), "").unwrap();
+        super::request_rescan();
+        let mut got = Vec::new();
+        for _ in 0..14 {
+            got.extend(w.step());
+        }
+        let mut b = bodies(&got);
+        b.sort();
+        assert_eq!(b, vec!["a-two", "b-two", "c-two"], "each once");
     }
 }

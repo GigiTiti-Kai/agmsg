@@ -3,6 +3,18 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   actasSpawnArgs,
+  startupInboxText,
+  kickoffText,
+  appendIfNew,
+  firstSight,
+  mergeById,
+  routeMessage,
+  hasNoTerminalByDesign,
+  missedNoticeIsLogged,
+  rosterNeedsReload,
+  knownTypes,
+  loadRoster,
+  agentCliArgs,
   actionFailedToast,
   deleteTeamForceToast,
   deleteTeamToast,
@@ -23,7 +35,22 @@ import {
   teamActionInvocation,
   type LoginShellInfo,
 } from "./App";
+import { createLatestOnly } from "./latestOnly";
 import { RailAvatar, SidebarUser, type Translate } from "./SidebarUser";
+
+describe("agentCliArgs", () => {
+  it("puts the model, then the effort, between the spawn options and the actas prompt", () => {
+    expect(agentCliArgs(["--x"], "--model", "opus", ["--effort", "high"], ["/agmsg actas w"])).toEqual(["--x", "--model", "opus", "--effort", "high", "/agmsg actas w"]);
+    expect(agentCliArgs([], "-m", "gpt-x", ["-c", "model_reasoning_effort=ultra"], ["$agmsg actas w"])).toEqual(["-m", "gpt-x", "-c", "model_reasoning_effort=ultra", "$agmsg actas w"]);
+  });
+  it("is the old argv when no model or effort was asked for", () => {
+    expect(agentCliArgs(["--x"], "--model", undefined, undefined, ["/agmsg actas w"])).toEqual(["--x", "/agmsg actas w"]);
+    expect(agentCliArgs([], null, "opus", [], ["p"])).toEqual(["p"]);
+  });
+  it("can take an effort without a model", () => {
+    expect(agentCliArgs([], "--model", undefined, ["--effort", "max"], ["p"])).toEqual(["--effort", "max", "p"]);
+  });
+});
 
 describe("actasSpawnArgs", () => {
   it("claude-code: no cmd_prefix/prompt_arg -> bare '/<cmd> actas <name>' (unchanged)", () => {
@@ -36,6 +63,123 @@ describe("actasSpawnArgs", () => {
 
   it("copilot: no cmd_prefix (defaults to '/') with prompt_arg '--interactive'", () => {
     expect(actasSpawnArgs("agmsg", "X", null, "--interactive")).toEqual(["--interactive", "/agmsg actas X"]);
+  });
+});
+
+describe("actasSpawnArgs with the startup inbox read", () => {
+  it("claude-code: the actas line, then an inbox read and reply instruction with this install's scripts", () => {
+    const [prompt] = actasSpawnArgs("agmsg", "white", null, null, "chess");
+    expect(prompt.startsWith("/agmsg actas white and then read your inbox")).toBe(true);
+    expect(prompt).toContain("bash ~/.agents/skills/agmsg/scripts/inbox.sh chess white");
+    expect(prompt).toContain('bash ~/.agents/skills/agmsg/scripts/send.sh chess white SENDER followed by your reply');
+    expect(prompt).toContain("act on what is waiting");
+  });
+  it("uses the renamed skill folder and the type's prompt shape", () => {
+    expect(actasSpawnArgs("agmsg-try", "OC", "$", "--prompt", "t")).toEqual([
+      "--prompt",
+      `$agmsg-try actas OC${startupInboxText("agmsg-try", "t", "OC")}`,
+    ]);
+    expect(startupInboxText("agmsg-try", "t", "OC")).toContain("~/.agents/skills/agmsg-try/scripts/inbox.sh t OC");
+  });
+  it("is one line without a character cmd.exe treats specially", () => {
+    const all = actasSpawnArgs("agmsg", "white", null, null, "chess")[0];
+    expect(all).not.toMatch(/[\r\n"<>&|^%()]/);
+  });
+  it("holds no home directory path", () => {
+    expect(startupInboxText("agmsg", "t", "n")).not.toMatch(/\/Users\/|\/home\//);
+  });
+});
+
+describe("appendIfNew", () => {
+  const m = (id: string) => ({ id, body: id });
+  it("history before watch: the same message from the watcher is not added twice", () => {
+    expect(appendIfNew([m("late-first")], m("late-first")).map((x) => x.id)).toEqual(["late-first"]);
+  });
+  it("watch before history: a second delivery of a message already in the feed adds nothing", () => {
+    const afterWatch = appendIfNew([], m("a"));
+    expect(appendIfNew(afterWatch, m("a"))).toHaveLength(1);
+  });
+  it("a store found again re-emits its rows: still once each", () => {
+    let feed = appendIfNew(appendIfNew([], m("a")), m("b"));
+    feed = appendIfNew(appendIfNew(feed, m("a")), m("b"));
+    expect(feed.map((x) => x.id)).toEqual(["a", "b"]);
+  });
+  it("a new id is appended in order", () => {
+    expect(appendIfNew([m("a")], m("b")).map((x) => x.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("mergeById and firstSight", () => {
+  const m = (id: string) => ({ id });
+  it("history then live that arrived during the load: each id once, live extras kept after", () => {
+    expect(mergeById([m("a"), m("b")], [m("b"), m("c")]).map((x) => x.id)).toEqual(["a", "b", "c"]);
+  });
+  it("a message re-emitted by a rediscovered store is typed into a pane once", () => {
+    const seen = new Map<string, Set<string>>();
+    expect(firstSight(seen, "p1", "m1")).toBe(true);
+    expect(firstSight(seen, "p1", "m1")).toBe(false);
+    expect(firstSight(seen, "p2", "m1")).toBe(true);
+  });
+  it("the per-pane record is bounded", () => {
+    const seen = new Map<string, Set<string>>();
+    for (let i = 0; i < 20; i++) firstSight(seen, "p1", `m${i}`, 10);
+    expect(seen.get("p1")!.size).toBe(10);
+  });
+});
+
+describe("routeMessage", () => {
+  const leaf = (id: string) => ({ kind: "leaf", paneId: id }) as never;
+  const windows = [
+    { team: "A", root: leaf("a-white") },
+    { team: "B", root: leaf("b-white") },
+    { team: "B", root: leaf("b-black") },
+  ];
+  const panes = [
+    { id: "a-white", label: "white", native: false },
+    { id: "b-white", label: "white", native: false },
+    { id: "b-black", label: "black", native: true },
+  ];
+
+  it("selected A, message for B: feeds B's pane only, and the room feed of A is unchanged", () => {
+    const r = routeMessage("A", { team: "B", to: "white" }, windows, panes);
+    expect(r.feed).toBe(false);
+    expect(r.pane?.id).toBe("b-white");
+  });
+
+  it("never reaches a same-named pane of another team", () => {
+    expect(routeMessage("A", { team: "B", to: "white" }, windows, panes).pane?.id).not.toBe("a-white");
+    expect(routeMessage("B", { team: "A", to: "white" }, windows, panes).pane?.id).toBe("a-white");
+  });
+
+  it("a native pane is not fed", () => {
+    expect(routeMessage("B", { team: "B", to: "black" }, windows, panes).pane).toBeUndefined();
+  });
+
+  it("the selected team's message updates the room feed and feeds its pane", () => {
+    const r = routeMessage("B", { team: "B", to: "white" }, windows, panes);
+    expect(r.feed).toBe(true);
+    expect(r.pane?.id).toBe("b-white");
+  });
+
+  it("a message for nobody with a pane feeds nothing", () => {
+    expect(routeMessage("B", { team: "B", to: "ghost" }, windows, panes).pane).toBeUndefined();
+  });
+
+  it("every miss says why, so none is silent", () => {
+    expect(routeMessage("B", { team: "B", to: "ghost" }, windows, panes).why).toContain("no open pane is named ghost");
+    expect(routeMessage("B", { team: "B", to: "black" }, windows, panes).why).toContain("native");
+    expect(routeMessage("B", { team: "C", to: "white" }, windows, panes).why).toContain("not in a window of team C");
+    expect(routeMessage("B", { team: "B", to: "white" }, windows, panes).why).toBeUndefined();
+  });
+});
+
+describe("kickoffText", () => {
+  it("names this install's scripts, the team, the agent and the sender; one line", () => {
+    const k = kickoffText("chesstest", "chess-try", "black", "chess", "Reply with one move");
+    expect(k).toContain("bash ~/.agents/skills/chesstest/scripts/inbox.sh chess-try black");
+    expect(k).toContain('bash ~/.agents/skills/chesstest/scripts/send.sh chess-try black chess "<your reply>"');
+    expect(k).toContain("not delivered");
+    expect(k).not.toContain("\n");
   });
 });
 
@@ -459,5 +603,89 @@ describe("renameTeamKey", () => {
     const prevTeamRefAfterFix = "new-team";
     byTeam = { ...byTeam, [prevTeamRefAfterFix]: "w-1" };
     expect(Object.keys(byTeam)).toEqual(["new-team"]);
+  });
+});
+
+describe("members with no terminal by design", () => {
+  it("recognises the app user and add-on members, not terminal agents", () => {
+    expect(hasNoTerminalByDesign(["agmsg-app"])).toBe(true);
+    expect(hasNoTerminalByDesign(["app-addon"])).toBe(true);
+    expect(hasNoTerminalByDesign(["claude"])).toBe(false);
+    expect(hasNoTerminalByDesign([])).toBe(false);
+  });
+
+  const mem = (name: string, ...types: string[]) => ({ name, types, project: "" });
+
+  it("reads types from the roster only for the team it was fetched for, and never fetches", () => {
+    const roster = { team: "t", list: [mem("chess", "app-addon"), mem("you", "agmsg-app"), mem("white", "claude")] };
+    expect(knownTypes(roster, "t", "chess")).toEqual(["app-addon"]);
+    expect(knownTypes(roster, "t", "you")).toEqual(["agmsg-app"]);
+    expect(knownTypes(roster, "t", "white")).toEqual(["claude"]);
+    expect(knownTypes(roster, "t", "ghost")).toBeUndefined();
+    expect(knownTypes(roster, "other", "chess")).toBeUndefined();
+    expect(knownTypes(null, "t", "chess")).toBeUndefined();
+  });
+
+  it("the same name with different types in two teams is never mixed up, across a switch with a fetch pending", async () => {
+    const latest = createLatestOnly();
+    let adopted: { team: string; list: unknown[] } | null = null;
+    const adopt = (r: { team: string; list: unknown[] }) => (adopted = r);
+    const gates: Record<string, (v: ReturnType<typeof mem>[]) => void> = {};
+    const fetchMembers = (team: string) => new Promise<ReturnType<typeof mem>[]>((res) => (gates[team] = res));
+    const a = loadRoster(latest, fetchMembers as never, "A", adopt as never);
+    gates.A([mem("same", "app-addon")]);
+    await a;
+    expect((adopted as never as { team: string }).team).toBe("A");
+    // switch to B: its fetch is pending, A's roster is still held
+    const b = loadRoster(latest, fetchMembers as never, "B", adopt as never);
+    expect(knownTypes(adopted as never, "B", "same")).toBeUndefined();
+    expect(knownTypes(adopted as never, "A", "same")).toEqual(["app-addon"]);
+    gates.B([mem("same", "claude")]);
+    await b;
+    expect(knownTypes(adopted as never, "B", "same")).toEqual(["claude"]);
+    expect(knownTypes(adopted as never, "A", "same")).toBeUndefined();
+  });
+
+  it("a member an add-on joined after the team was opened is known once the list is read again", async () => {
+    const latest = createLatestOnly();
+    let adopted: { team: string; list: ReturnType<typeof mem>[] } | null = null;
+    const adopt = (r: { team: string; list: ReturnType<typeof mem>[] }) => (adopted = r);
+    let calls = 0;
+    let served = [mem("you", "agmsg-app"), mem("real", "claude")];
+    const fetchMembers = async () => (calls++, served);
+    await loadRoster(latest, fetchMembers as never, "t", adopt as never);
+    // before: chess joined after the list was read, so it is logged as a miss
+    expect(missedNoticeIsLogged(adopted, "t", "chess")).toBe(true);
+    served = [...served, mem("chess", "app-addon"), mem("white", "claude")];
+    expect(rosterNeedsReload("t", "t")).toBe(true);
+    await loadRoster(latest, fetchMembers as never, "t", adopt as never);
+    expect(calls).toBe(2);
+    expect(missedNoticeIsLogged(adopted, "t", "chess")).toBe(false);
+    // a member that really has no pane is still logged, and so is a name nobody knows
+    expect(missedNoticeIsLogged(adopted, "t", "white")).toBe(true);
+    expect(missedNoticeIsLogged(adopted, "t", "ghost")).toBe(true);
+    expect(missedNoticeIsLogged(adopted, "t", "you")).toBe(false);
+  });
+
+  it("only the team on screen is read again after a join", () => {
+    expect(rosterNeedsReload("t", "t")).toBe(true);
+    expect(rosterNeedsReload("other", "t")).toBe(false);
+    expect(rosterNeedsReload("t", "")).toBe(false);
+    expect(rosterNeedsReload("", "")).toBe(false);
+  });
+
+  it("a response for a team already switched away from is dropped", async () => {
+    const latest = createLatestOnly();
+    let adopted: { team: string } | null = null;
+    const adopt = (r: { team: string }) => (adopted = r);
+    const gates: Record<string, (v: ReturnType<typeof mem>[]) => void> = {};
+    const fetchMembers = (team: string) => new Promise<ReturnType<typeof mem>[]>((res) => (gates[team] = res));
+    const a = loadRoster(latest, fetchMembers as never, "A", adopt as never);
+    const b = loadRoster(latest, fetchMembers as never, "B", adopt as never);
+    gates.B([mem("same", "claude")]);
+    await b;
+    gates.A([mem("same", "app-addon")]);
+    expect(await a).toEqual([mem("same", "app-addon")]);
+    expect((adopted as never as { team: string }).team).toBe("B");
   });
 });

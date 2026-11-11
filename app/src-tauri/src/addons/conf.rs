@@ -11,8 +11,8 @@ use super::panes::Declared;
 pub const MAX_CONF_BYTES: usize = 64 * 1024;
 pub const MAX_CONF_LINES: usize = 1000;
 
-pub const PERMISSIONS: [&str; 4] = ["messages:read", "files:read", "git:read", "network"];
-const KEYS: [&str; 7] = ["title", "entry", "min_app", "protocol", "permissions", "network", "opens"];
+pub const PERMISSIONS: [&str; 7] = ["messages:read", "files:read", "git:read", "network", "team:join", "messages:send", "agents:spawn"];
+const KEYS: [&str; 10] = ["title", "entry", "min_app", "protocol", "permissions", "network", "opens", "member", "locales", "default"];
 const OPENS: [&str; 2] = ["path", "url"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +25,12 @@ pub struct AddonConf {
     /// The raw `network` value (`*` or a list of origins), when declared.
     pub network: Option<String>,
     pub opens: Vec<String>,
+    /// The name the add-on asks for as a team member (`member`), when declared.
+    pub member: Option<String>,
+    /// The language tags the add-on ships strings for (`locales`); advisory, empty when not declared.
+    pub locales: Vec<String>,
+    /// The tag it falls back to (`default`), `en` when not declared.
+    pub default_locale: String,
     /// `why.<permission>` lines, shown next to each permission.
     pub why: BTreeMap<String, String>,
 }
@@ -57,6 +63,15 @@ pub fn read_bounded(path: &std::path::Path) -> ConfRead {
     } else {
         ConfRead::Ok(buf)
     }
+}
+
+/// A BCP 47 shape: a 2-3 letter language, then subtags of 2-8 letters or digits (en, ja, zh-CN, pt-BR).
+fn is_lang_tag(t: &str) -> bool {
+    let mut parts = t.split('-');
+    let Some(lang) = parts.next() else { return false };
+    (2..=3).contains(&lang.len())
+        && lang.bytes().all(|b| b.is_ascii_alphabetic())
+        && parts.all(|p| (2..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 fn list(v: &str) -> Vec<String> {
@@ -132,6 +147,18 @@ pub fn parse(text: &str, rel: &str) -> ConfReport {
     if has("git:read") && !has("files:read") {
         errors.push(format!("{}: git:read needs files:read too.", at("permissions")));
     }
+    for p in ["messages:send", "agents:spawn"] {
+        if has(p) && !has("team:join") {
+            errors.push(format!("{}: {p} needs team:join too.", at("permissions")));
+        }
+    }
+    if let Some(m) = val("member") {
+        if !has("team:join") {
+            errors.push(format!("{}: \"member\" is set but the team:join permission is not declared.", at("member")));
+        } else if let Err(why) = super::agents::validate_name(m) {
+            errors.push(format!("{}: member {why}.", at("member")));
+        }
+    }
     if has("network") {
         match val("network") {
             None | Some("") => errors.push(format!("{}: network is declared but \"network = *\" or a list of origins is missing.", at("permissions"))),
@@ -167,6 +194,29 @@ pub fn parse(text: &str, rel: &str) -> ConfReport {
             }
         }
     }
+    // `locales` and `default` are advisory: a bad entry is dropped with a warning, never an error, so they can
+    // never make an add-on refuse to install. The add-on still gets the app's language either way.
+    let mut locales: Vec<String> = Vec::new();
+    for t in val("locales").map(list).unwrap_or_default() {
+        if !is_lang_tag(&t) {
+            warnings.push(format!("{}: \"{t}\" is not a language tag like en or pt-BR; ignored.", at("locales")));
+        } else if locales.iter().any(|o| o.eq_ignore_ascii_case(&t)) {
+            warnings.push(format!("{}: \"{t}\" is listed twice; ignored.", at("locales")));
+        } else {
+            locales.push(t);
+        }
+    }
+    let mut default_locale = "en".to_string();
+    if let Some(d) = val("default").filter(|d| !d.is_empty()) {
+        if !is_lang_tag(d) {
+            warnings.push(format!("{}: \"{d}\" is not a language tag like en or pt-BR; \"en\" is used.", at("default")));
+        } else {
+            default_locale = d.to_string();
+            if !locales.is_empty() && !locales.iter().any(|l| l.eq_ignore_ascii_case(d)) {
+                warnings.push(format!("{}: \"{d}\" is not in \"locales\".", at("default")));
+            }
+        }
+    }
     if let Some(e) = val("entry") {
         if !e.is_empty() && !super::server::valid_relative(e) {
             errors.push(format!("{}: entry must be a plain path under web/.", at("entry")));
@@ -190,6 +240,9 @@ pub fn parse(text: &str, rel: &str) -> ConfReport {
             permissions: perms.clone(),
             network: val("network").map(str::to_string),
             opens,
+            member: val("member").map(str::to_string),
+            locales,
+            default_locale,
             why,
         })
     } else {
@@ -245,7 +298,7 @@ impl AddonConf {
         } else {
             None
         };
-        Declared { messages_read: has("messages:read"), files_read: has("files:read"), git_read: has("git:read"), network }
+        Declared { messages_read: has("messages:read"), files_read: has("files:read"), git_read: has("git:read"), team_join: has("team:join"), messages_send: has("messages:send"), agents_spawn: has("agents:spawn"), member: self.member.clone(), network }
     }
 }
 
@@ -302,6 +355,27 @@ mod tests {
         assert!(errs("title=T\nprotocol=1\n=x\n").iter().any(|e| e.contains("expected key = value")));
         assert!(errs("title=T\nprotocol=1\nopens=file\n").iter().any(|e| e.contains("unknown \"file\" (path or url)")));
         assert!(errs("title=T\nprotocol=1\nmin_app=0.6\n").iter().any(|e| e.contains("min_app must look like 0.6.0")));
+    }
+
+    #[test]
+    fn locales_and_default_are_advisory_and_never_refuse() {
+        let c = ok("title=T\nprotocol=1\nlocales=en, ja, zh-CN\ndefault=ja\n");
+        assert_eq!(c.locales, vec!["en", "ja", "zh-CN"]);
+        assert_eq!(c.default_locale, "ja");
+        let none = ok("title=T\nprotocol=1\n");
+        assert!(none.locales.is_empty() && none.default_locale == "en");
+        // A bad or repeated tag is dropped with a warning; the conf still parses.
+        let r = parse("title=T\nprotocol=1\nlocales=en, japanese!, EN, ja\ndefault=x\n", "c");
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let c = r.conf.expect("still installs");
+        assert_eq!(c.locales, vec!["en", "ja"]);
+        assert_eq!(c.default_locale, "en");
+        assert!(r.warnings.iter().any(|w| w.contains("\"japanese!\" is not a language tag") && w.contains("ignored")), "{:?}", r.warnings);
+        assert!(r.warnings.iter().any(|w| w.contains("\"EN\" is listed twice")), "{:?}", r.warnings);
+        assert!(r.warnings.iter().any(|w| w.contains("\"x\" is not a language tag") && w.contains("\"en\" is used")), "{:?}", r.warnings);
+        let r = parse("title=T\nprotocol=1\nlocales=en\ndefault=ja\n", "c");
+        assert!(r.errors.is_empty() && r.conf.is_some());
+        assert!(r.warnings.iter().any(|w| w.contains("\"ja\" is not in \"locales\"")), "{:?}", r.warnings);
     }
 
     #[test]
@@ -363,5 +437,20 @@ mod tests {
     fn declared_matches_every_permission() {
         let d = ok("title=T\nprotocol=1\npermissions=messages:read,files:read,git:read\n").declared();
         assert!(d.messages_read && d.files_read && d.git_read);
+    }
+
+    #[test]
+    fn team_powers_need_team_join_and_a_valid_member_name() {
+        let base = "title = T\nprotocol = 1\n";
+        let r = parse(&format!("{base}permissions = messages:send\n"), "c");
+        assert!(r.errors.iter().any(|e| e.contains("messages:send needs team:join")), "{:?}", r.errors);
+        let r = parse(&format!("{base}permissions = team:join, agents:spawn\nmember = bad.name\n"), "c");
+        assert!(r.errors.iter().any(|e| e.contains("member must not contain")), "{:?}", r.errors);
+        let r = parse(&format!("{base}permissions = messages:read\nmember = x\n"), "c");
+        assert!(r.errors.iter().any(|e| e.contains("team:join permission is not declared")), "{:?}", r.errors);
+        let c = ok(&format!("{base}permissions = messages:read, team:join, messages:send, agents:spawn\nmember = referee\n"));
+        let d = c.declared();
+        assert!(d.team_join && d.messages_send && d.agents_spawn && !d.files_read);
+        assert_eq!(d.member.as_deref(), Some("referee"));
     }
 }
